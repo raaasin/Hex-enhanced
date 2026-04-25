@@ -380,7 +380,6 @@ private extension TranscriptionFeature {
     return .merge(
       .cancel(id: CancelID.recordingCleanup),
       .cancel(id: CancelID.formatterFeedback),
-      .send(.captureFormatterContext),
       .run { [sleepManagement, preventSleep = state.hexSettings.preventSystemSleep] _ in
         // Play sound immediately for instant feedback
         soundEffect.play(.startRecording)
@@ -540,70 +539,96 @@ private extension TranscriptionFeature {
     }
 
     let duration = state.recordingStartTime.map { Date().timeIntervalSince($0) } ?? 0
+    state.formatterStatusText = "Checking selection"
+    state.formatterErrorText = nil
 
-    if let formatterSession = state.formatterSession {
-      transcriptionFeatureLogger.notice("Formatter session armed; treating transcript as instruction")
+    return .run { send in
+      let frontmostApp = await selectionText.frontmostApp()
+      let selectedText = await selectionText.captureSelectedText()?.trimmingCharacters(in: .whitespacesAndNewlines)
+
+      let captureResult: FormatterCaptureResult
+      if let selectedText, !selectedText.isEmpty {
+        let isWithinMaxLength = selectionText.isWithinMaxSelectedTextLength(selectedText)
+        if isWithinMaxLength {
+          captureResult = .init(
+            session: .init(
+              originalSelection: selectedText,
+              placeholder: Self.formattingPlaceholder
+            ),
+            frontmostApp: frontmostApp,
+            didExceedMaxLength: false
+          )
+        } else {
+          captureResult = .init(
+            session: nil,
+            frontmostApp: frontmostApp,
+            didExceedMaxLength: true
+          )
+        }
+      } else {
+        captureResult = .init(
+          session: nil,
+          frontmostApp: frontmostApp,
+          didExceedMaxLength: false
+        )
+      }
+
+      await send(.formatterContextCaptured(captureResult))
+
+      guard let formatterSession = captureResult.session else {
+        await send(.formatterFlowFallbackToTranscription(result, audioURL, duration))
+        return
+      }
+
+      transcriptionFeatureLogger.notice("Formatter context captured post-transcription; treating transcript as instruction")
+
       let instruction = result.trimmingCharacters(in: .whitespacesAndNewlines)
       guard !instruction.isEmpty else {
-        state.isTranscribing = false
-        state.isPrewarming = false
-        clearFormatterSession(&state)
-        return .none
+        await send(.formatterFlowFallbackToTranscription(result, audioURL, duration))
+        return
       }
 
-      state.formatterStatusText = "Formatting selection"
-      state.formatterErrorText = nil
-
-      return .run { send in
-        var insertedPlaceholder = false
-        do {
-          insertedPlaceholder = await selectionText.replaceSelectedText(formatterSession.placeholder)
-          guard insertedPlaceholder else {
-            transcriptionFeatureLogger.notice(
-              "Formatter placeholder insertion failed before flow start; falling back to normal paste flow"
-            )
-            await send(.formatterFlowFallbackToTranscription(result, audioURL, duration))
-            return
-          }
-
-          let formatted = try await textFormatting.format(
-            formatterSession.originalSelection,
-            instruction
+      var insertedPlaceholder = false
+      do {
+        insertedPlaceholder = await selectionText.replaceSelectedText(formatterSession.placeholder)
+        guard insertedPlaceholder else {
+          transcriptionFeatureLogger.notice(
+            "Formatter placeholder insertion failed before flow start; falling back to normal paste flow"
           )
-
-          let didReselectPlaceholder = await selectionText.selectLeftCharacters(formatterSession.placeholder.count)
-          guard didReselectPlaceholder else {
-            throw FormatterFlowError.placeholderSelectionFailed
-          }
-
-          let didReplacePlaceholder = await selectionText.replaceSelectedText(formatted)
-          guard didReplacePlaceholder else {
-            throw FormatterFlowError.formattedReplacementFailed
-          }
-
-          transcriptionFeatureLogger.notice("Formatting flow completed with output length \(formatted.count)")
-          await send(.formatterFlowCompleted(formatted, audioURL, duration))
-        } catch {
-          if insertedPlaceholder {
-            _ = await selectionText.selectLeftCharacters(formatterSession.placeholder.count)
-          }
-          let didRestoreOriginal = await selectionText.replaceSelectedText(formatterSession.originalSelection)
-          if !didRestoreOriginal {
-            transcriptionFeatureLogger.error("Formatting failed and original selection restore also failed")
-          }
-          transcriptionFeatureLogger.error("Formatting flow failed: \(error.localizedDescription)")
-          await send(.formatterFlowFailed(condensedFormatterError(error), audioURL))
+          await send(.formatterFlowFallbackToTranscription(result, audioURL, duration))
+          return
         }
-      }
-      .cancellable(id: CancelID.transcription)
-    }
 
-    return finalizeStandardTranscription(
-      &state,
-      result: result,
-      audioURL: audioURL,
-      duration: duration
-    )
+        let formatted = try await textFormatting.format(
+          formatterSession.originalSelection,
+          instruction
+        )
+
+        let didReselectPlaceholder = await selectionText.selectLeftCharacters(formatterSession.placeholder.count)
+        guard didReselectPlaceholder else {
+          throw FormatterFlowError.placeholderSelectionFailed
+        }
+
+        let didReplacePlaceholder = await selectionText.replaceSelectedText(formatted)
+        guard didReplacePlaceholder else {
+          throw FormatterFlowError.formattedReplacementFailed
+        }
+
+        transcriptionFeatureLogger.notice("Formatting flow completed with output length \(formatted.count)")
+        await send(.formatterFlowCompleted(formatted, audioURL, duration))
+      } catch {
+        if insertedPlaceholder {
+          _ = await selectionText.selectLeftCharacters(formatterSession.placeholder.count)
+        }
+        let didRestoreOriginal = await selectionText.replaceSelectedText(formatterSession.originalSelection)
+        if !didRestoreOriginal {
+          transcriptionFeatureLogger.error("Formatting failed and original selection restore also failed")
+        }
+        transcriptionFeatureLogger.error("Formatting flow failed: \(error.localizedDescription)")
+        await send(.formatterFlowFailed(condensedFormatterError(error), audioURL))
+      }
+    }
+    .cancellable(id: CancelID.transcription)
   }
 
   func handleFormatterFlowFallbackToTranscription(
