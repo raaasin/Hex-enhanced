@@ -16,19 +16,25 @@ struct TranscriptionIndicatorView: View {
     case optionKeyPressed
     case recording
     case transcribing
+    case formatterArmed
+    case formatting
     case prewarming
   }
 
   var status: Status
   var meter: Meter
+  var errorText: String?
 
   let transcribeBaseColor: Color = .blue
+  let formatterBaseColor: Color = .orange
   private var backgroundColor: Color {
     switch status {
     case .hidden: return Color.clear
     case .optionKeyPressed: return Color.black
     case .recording: return .red.mix(with: .black, by: 0.5).mix(with: .red, by: meter.averagePower * 3)
     case .transcribing: return transcribeBaseColor.mix(with: .black, by: 0.5)
+    case .formatterArmed: return formatterBaseColor.mix(with: .black, by: 0.45)
+    case .formatting: return formatterBaseColor.mix(with: .black, by: 0.45)
     case .prewarming: return transcribeBaseColor.mix(with: .black, by: 0.5)
     }
   }
@@ -39,6 +45,8 @@ struct TranscriptionIndicatorView: View {
     case .optionKeyPressed: return Color.black
     case .recording: return Color.red.mix(with: .white, by: 0.1).opacity(0.6)
     case .transcribing: return transcribeBaseColor.mix(with: .white, by: 0.1).opacity(0.6)
+    case .formatterArmed: return formatterBaseColor.mix(with: .white, by: 0.1).opacity(0.65)
+    case .formatting: return formatterBaseColor.mix(with: .white, by: 0.1).opacity(0.65)
     case .prewarming: return transcribeBaseColor.mix(with: .white, by: 0.1).opacity(0.6)
     }
   }
@@ -49,6 +57,8 @@ struct TranscriptionIndicatorView: View {
     case .optionKeyPressed: return Color.clear
     case .recording: return Color.red
     case .transcribing: return transcribeBaseColor
+    case .formatterArmed: return formatterBaseColor
+    case .formatting: return formatterBaseColor
     case .prewarming: return transcribeBaseColor
     }
   }
@@ -56,6 +66,35 @@ struct TranscriptionIndicatorView: View {
   private let cornerRadius: CGFloat = 8
   private let baseWidth: CGFloat = 16
   private let expandedWidth: CGFloat = 56
+
+  private var bubbleText: String? {
+    if let errorText {
+      return errorText
+    }
+    if status == .prewarming {
+      return "Model prewarming..."
+    }
+    return nil
+  }
+
+  private var modeSymbolName: String? {
+    switch status {
+    case .formatterArmed:
+      return "wand.and.stars"
+    case .formatting:
+      return "sparkles"
+    default:
+      return nil
+    }
+  }
+
+  private var modeSymbolColor: Color {
+    formatterBaseColor.mix(with: .white, by: 0.65)
+  }
+
+  private var bubbleBackground: Color {
+    errorText == nil ? Color.black.opacity(0.82) : Color.red.mix(with: .black, by: 0.6).opacity(0.95)
+  }
 
   var isHidden: Bool {
     status == .hidden
@@ -110,7 +149,7 @@ struct TranscriptionIndicatorView: View {
         )
         .animation(.interactiveSpring(), value: meter)
         .frame(
-          width: status == .recording ? expandedWidth : baseWidth,
+          width: status == .recording ? expandedWidth : status == .formatting ? 24 : 16,
           height: baseWidth
         )
         .opacity(status == .hidden ? 0 : 1)
@@ -120,29 +159,38 @@ struct TranscriptionIndicatorView: View {
         .changeEffect(.glow(color: .red.opacity(0.5), radius: 8), value: status)
         .changeEffect(.shine(angle: .degrees(0), duration: 0.6), value: transcribeEffect)
         .compositingGroup()
-        .task(id: status == .transcribing) {
-          while status == .transcribing, !Task.isCancelled {
+        .task(id: status == .transcribing || status == .formatting) {
+          while (status == .transcribing || status == .formatting), !Task.isCancelled {
             transcribeEffect += 1
             try? await Task.sleep(for: .seconds(0.25))
           }
         }
+
+      if let modeSymbolName {
+        Image(systemName: modeSymbolName)
+          .font(.system(size: 9, weight: .semibold))
+          .foregroundStyle(modeSymbolColor)
+          .opacity(status == .formatting ? 0.95 : 0.8)
+          .scaleEffect(status == .formatting ? 1.02 : 1)
+          .allowsHitTesting(false)
+      }
       
-      // Show tooltip when prewarming
-      if status == .prewarming {
-        VStack(spacing: 4) {
-          Text("Model prewarming...")
-            .font(.system(size: 12, weight: .medium))
-            .foregroundColor(.white)
-            .padding(.horizontal, 8)
-            .padding(.vertical, 4)
-            .background(
-              RoundedRectangle(cornerRadius: 4)
-                .fill(Color.black.opacity(0.8))
-            )
-        }
-        .offset(y: -24)
-        .transition(.opacity)
-        .zIndex(2)
+      if status != .hidden, let bubbleText {
+        Text(bubbleText)
+          .font(.system(size: 12, weight: .medium))
+          .foregroundColor(.white)
+          .multilineTextAlignment(.leading)
+          .lineLimit(3)
+          .padding(.horizontal, 10)
+          .padding(.vertical, 6)
+          .background(
+            RoundedRectangle(cornerRadius: 6)
+              .fill(bubbleBackground)
+          )
+          .frame(maxWidth: 240, alignment: .leading)
+          .offset(x: 14, y: -26)
+          .transition(.opacity.combined(with: .scale(scale: 0.96, anchor: .topLeading)))
+          .zIndex(2)
       }
     }
     .enableInjection()
@@ -151,11 +199,11 @@ struct TranscriptionIndicatorView: View {
 
 #Preview("HEX") {
   VStack(spacing: 8) {
-    TranscriptionIndicatorView(status: .hidden, meter: .init(averagePower: 0, peakPower: 0))
-    TranscriptionIndicatorView(status: .optionKeyPressed, meter: .init(averagePower: 0, peakPower: 0))
-    TranscriptionIndicatorView(status: .recording, meter: .init(averagePower: 0.5, peakPower: 0.5))
-    TranscriptionIndicatorView(status: .transcribing, meter: .init(averagePower: 0, peakPower: 0))
-    TranscriptionIndicatorView(status: .prewarming, meter: .init(averagePower: 0, peakPower: 0))
+    TranscriptionIndicatorView(status: .hidden, meter: .init(averagePower: 0, peakPower: 0), errorText: nil)
+    TranscriptionIndicatorView(status: .optionKeyPressed, meter: .init(averagePower: 0, peakPower: 0), errorText: nil)
+    TranscriptionIndicatorView(status: .formatterArmed, meter: .init(averagePower: 0, peakPower: 0), errorText: nil)
+    TranscriptionIndicatorView(status: .formatting, meter: .init(averagePower: 0, peakPower: 0), errorText: nil)
+    TranscriptionIndicatorView(status: .prewarming, meter: .init(averagePower: 0, peakPower: 0), errorText: "Selected text is too long to format.\nSelect a shorter passage and try again.")
   }
   .padding(40)
 }

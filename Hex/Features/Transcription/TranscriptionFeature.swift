@@ -27,6 +27,9 @@ struct TranscriptionFeature {
     var meter: Meter = .init(averagePower: 0, peakPower: 0)
     var sourceAppBundleID: String?
     var sourceAppName: String?
+    var formatterSession: FormatterSession?
+    var formatterStatusText: String?
+    var formatterErrorText: String?
     @Shared(.hexSettings) var hexSettings: HexSettings
     @Shared(.isRemappingScratchpadFocused) var isRemappingScratchpadFocused: Bool = false
     @Shared(.modelBootstrapState) var modelBootstrapState: ModelBootstrapState
@@ -44,6 +47,8 @@ struct TranscriptionFeature {
     // Recording flow
     case startRecording
     case stopRecording
+    case captureFormatterContext
+    case formatterContextCaptured(FormatterCaptureResult)
 
     // Cancel/discard flow
     case cancel   // Explicit cancellation with sound
@@ -52,6 +57,10 @@ struct TranscriptionFeature {
     // Transcription result flow
     case transcriptionResult(String, URL)
     case transcriptionError(Error, URL?)
+    case formatterFlowCompleted(String, URL, TimeInterval)
+    case formatterFlowFailed(String, URL?)
+    case formatterFlowFallbackToTranscription(String, URL, TimeInterval)
+    case clearFormatterFeedback
 
     // Model availability
     case modelMissing
@@ -61,11 +70,15 @@ struct TranscriptionFeature {
     case metering
     case recordingCleanup
     case transcription
+    case formatterContextCapture
+    case formatterFeedback
   }
 
   @Dependency(\.transcription) var transcription
   @Dependency(\.recording) var recording
   @Dependency(\.pasteboard) var pasteboard
+  @Dependency(\.selectionText) var selectionText
+  @Dependency(\.textFormatting) var textFormatting
   @Dependency(\.keyEventMonitor) var keyEventMonitor
   @Dependency(\.soundEffects) var soundEffect
   @Dependency(\.sleepManagement) var sleepManagement
@@ -114,6 +127,14 @@ struct TranscriptionFeature {
       case .stopRecording:
         return handleStopRecording(&state)
 
+      case .captureFormatterContext:
+        state.formatterStatusText = "Checking selection"
+        state.formatterErrorText = nil
+        return captureFormatterContextEffect()
+
+      case let .formatterContextCaptured(captureResult):
+        return handleFormatterContextCaptured(&state, captureResult: captureResult)
+
       // MARK: - Transcription Results
 
       case let .transcriptionResult(result, audioURL):
@@ -121,6 +142,30 @@ struct TranscriptionFeature {
 
       case let .transcriptionError(error, audioURL):
         return handleTranscriptionError(&state, error: error, audioURL: audioURL)
+
+      case let .formatterFlowCompleted(formattedText, audioURL, duration):
+        return handleFormatterFlowCompleted(
+          &state,
+          formattedText: formattedText,
+          audioURL: audioURL,
+          duration: duration
+        )
+
+      case let .formatterFlowFailed(reason, audioURL):
+        return handleFormatterFlowFailed(&state, reason: reason, audioURL: audioURL)
+
+      case let .formatterFlowFallbackToTranscription(result, audioURL, duration):
+        return handleFormatterFlowFallbackToTranscription(
+          &state,
+          result: result,
+          audioURL: audioURL,
+          duration: duration
+        )
+
+      case .clearFormatterFeedback:
+        state.formatterStatusText = nil
+        state.formatterErrorText = nil
+        return .none
 
       case .modelMissing:
         return .none
@@ -143,6 +188,38 @@ struct TranscriptionFeature {
       }
     }
   }
+}
+
+extension TranscriptionFeature {
+  struct FormatterSession: Equatable, Sendable {
+    var originalSelection: String
+    var placeholder: String
+  }
+
+  struct FormatterCaptureResult: Equatable, Sendable {
+    var session: FormatterSession?
+    var frontmostApp: SelectionTextClient.FrontmostApp?
+    var didExceedMaxLength: Bool
+  }
+
+  enum FormatterFlowError: LocalizedError, Sendable {
+    case placeholderInsertionFailed
+    case placeholderSelectionFailed
+    case formattedReplacementFailed
+
+    var errorDescription: String? {
+      switch self {
+      case .placeholderInsertionFailed:
+        return "Could not place formatting placeholder"
+      case .placeholderSelectionFailed:
+        return "Could not reselect formatting placeholder"
+      case .formattedReplacementFailed:
+        return "Could not insert formatted text"
+      }
+    }
+  }
+
+  static let formattingPlaceholder = "[Hex formatting...]"
 }
 
 // MARK: - Effects: Metering & HotKey
@@ -288,6 +365,9 @@ private extension TranscriptionFeature {
     state.isRecording = true
     let startTime = now
     state.recordingStartTime = startTime
+    state.formatterSession = nil
+    state.formatterStatusText = nil
+    state.formatterErrorText = nil
     
     // Capture the active application
     if let activeApp = NSWorkspace.shared.frontmostApplication {
@@ -299,6 +379,8 @@ private extension TranscriptionFeature {
     // Prevent system sleep during recording
     return .merge(
       .cancel(id: CancelID.recordingCleanup),
+      .cancel(id: CancelID.formatterFeedback),
+      .send(.captureFormatterContext),
       .run { [sleepManagement, preventSleep = state.hexSettings.preventSystemSleep] _ in
         // Play sound immediately for instant feedback
         soundEffect.play(.startRecording)
@@ -336,6 +418,9 @@ private extension TranscriptionFeature {
     )
 
     guard decision == .proceedToTranscription else {
+      state.formatterStatusText = nil
+      state.formatterErrorText = nil
+      clearFormatterSession(&state)
       // If the user recorded for less than minimumKeyTime and the hotkey is modifier-only,
       // discard the audio to avoid accidental triggers.
       transcriptionFeatureLogger.notice("Discarding short recording per decision \(String(describing: decision))")
@@ -385,6 +470,43 @@ private extension TranscriptionFeature {
     }
     .cancellable(id: CancelID.transcription)
   }
+
+  func captureFormatterContextEffect() -> Effect<Action> {
+    .run { send in
+      let frontmostApp = await selectionText.frontmostApp()
+      let selectedText = await selectionText.captureSelectedText()?.trimmingCharacters(in: .whitespacesAndNewlines)
+
+      let captureResult: FormatterCaptureResult
+      if let selectedText, !selectedText.isEmpty {
+        let isWithinMaxLength = selectionText.isWithinMaxSelectedTextLength(selectedText)
+        if isWithinMaxLength {
+          captureResult = .init(
+            session: .init(
+              originalSelection: selectedText,
+              placeholder: Self.formattingPlaceholder
+            ),
+            frontmostApp: frontmostApp,
+            didExceedMaxLength: false
+          )
+        } else {
+          captureResult = .init(
+            session: nil,
+            frontmostApp: frontmostApp,
+            didExceedMaxLength: true
+          )
+        }
+      } else {
+        captureResult = .init(
+          session: nil,
+          frontmostApp: frontmostApp,
+          didExceedMaxLength: false
+        )
+      }
+
+      await send(.formatterContextCaptured(captureResult))
+    }
+    .cancellable(id: CancelID.formatterContextCapture, cancelInFlight: true)
+  }
 }
 
 // MARK: - Transcription Handlers
@@ -395,11 +517,11 @@ private extension TranscriptionFeature {
     result: String,
     audioURL: URL
   ) -> Effect<Action> {
-    state.isTranscribing = false
-    state.isPrewarming = false
-
     // Check for force quit command (emergency escape hatch)
     if ForceQuitCommandDetector.matches(result) {
+      state.isTranscribing = false
+      state.isPrewarming = false
+      clearFormatterSession(&state)
       transcriptionFeatureLogger.fault("Force quit voice command recognized; terminating Hex.")
       return .run { _ in
         try? FileManager.default.removeItem(at: audioURL)
@@ -411,59 +533,172 @@ private extension TranscriptionFeature {
 
     // If empty text, nothing else to do
     guard !result.isEmpty else {
+      state.isTranscribing = false
+      state.isPrewarming = false
+      state.formatterStatusText = nil
       return .none
     }
 
     let duration = state.recordingStartTime.map { Date().timeIntervalSince($0) } ?? 0
 
-    transcriptionFeatureLogger.info("Raw transcription: '\(result)'")
-    let remappings = state.hexSettings.wordRemappings
-    let removalsEnabled = state.hexSettings.wordRemovalsEnabled
-    let removals = state.hexSettings.wordRemovals
-    let modifiedResult: String
-    if state.isRemappingScratchpadFocused {
-      modifiedResult = result
-      transcriptionFeatureLogger.info("Scratchpad focused; skipping word modifications")
-    } else {
-      var output = result
-      if removalsEnabled {
-        let removedResult = WordRemovalApplier.apply(output, removals: removals)
-        if removedResult != output {
-          let enabledRemovalCount = removals.filter(\.isEnabled).count
-          transcriptionFeatureLogger.info("Applied \(enabledRemovalCount) word removal(s)")
+    if let formatterSession = state.formatterSession {
+      transcriptionFeatureLogger.notice("Formatter session armed; treating transcript as instruction")
+      let instruction = result.trimmingCharacters(in: .whitespacesAndNewlines)
+      guard !instruction.isEmpty else {
+        state.isTranscribing = false
+        state.isPrewarming = false
+        clearFormatterSession(&state)
+        return .none
+      }
+
+      state.formatterStatusText = "Formatting selection"
+      state.formatterErrorText = nil
+
+      return .run { send in
+        var insertedPlaceholder = false
+        do {
+          insertedPlaceholder = await selectionText.replaceSelectedText(formatterSession.placeholder)
+          guard insertedPlaceholder else {
+            transcriptionFeatureLogger.notice(
+              "Formatter placeholder insertion failed before flow start; falling back to normal paste flow"
+            )
+            await send(.formatterFlowFallbackToTranscription(result, audioURL, duration))
+            return
+          }
+
+          let formatted = try await textFormatting.format(
+            formatterSession.originalSelection,
+            instruction
+          )
+
+          let didReselectPlaceholder = await selectionText.selectLeftCharacters(formatterSession.placeholder.count)
+          guard didReselectPlaceholder else {
+            throw FormatterFlowError.placeholderSelectionFailed
+          }
+
+          let didReplacePlaceholder = await selectionText.replaceSelectedText(formatted)
+          guard didReplacePlaceholder else {
+            throw FormatterFlowError.formattedReplacementFailed
+          }
+
+          transcriptionFeatureLogger.notice("Formatting flow completed with output length \(formatted.count)")
+          await send(.formatterFlowCompleted(formatted, audioURL, duration))
+        } catch {
+          if insertedPlaceholder {
+            _ = await selectionText.selectLeftCharacters(formatterSession.placeholder.count)
+          }
+          let didRestoreOriginal = await selectionText.replaceSelectedText(formatterSession.originalSelection)
+          if !didRestoreOriginal {
+            transcriptionFeatureLogger.error("Formatting failed and original selection restore also failed")
+          }
+          transcriptionFeatureLogger.error("Formatting flow failed: \(error.localizedDescription)")
+          await send(.formatterFlowFailed(condensedFormatterError(error), audioURL))
         }
-        output = removedResult
       }
-      let remappedResult = WordRemappingApplier.apply(output, remappings: remappings)
-      if remappedResult != output {
-        transcriptionFeatureLogger.info("Applied \(remappings.count) word remapping(s)")
-      }
-      modifiedResult = remappedResult
+      .cancellable(id: CancelID.transcription)
     }
 
-    guard !modifiedResult.isEmpty else {
+    return finalizeStandardTranscription(
+      &state,
+      result: result,
+      audioURL: audioURL,
+      duration: duration
+    )
+  }
+
+  func handleFormatterFlowFallbackToTranscription(
+    _ state: inout State,
+    result: String,
+    audioURL: URL,
+    duration: TimeInterval
+  ) -> Effect<Action> {
+    finalizeStandardTranscription(
+      &state,
+      result: result,
+      audioURL: audioURL,
+      duration: duration
+    )
+  }
+
+  func handleFormatterContextCaptured(
+    _ state: inout State,
+    captureResult: FormatterCaptureResult
+  ) -> Effect<Action> {
+    if let frontmostApp = captureResult.frontmostApp {
+      state.sourceAppBundleID = frontmostApp.bundleIdentifier
+      state.sourceAppName = frontmostApp.localizedName
+    }
+
+    if captureResult.didExceedMaxLength {
+      state.formatterSession = nil
+      state.formatterStatusText = nil
+      state.formatterErrorText = "Selected text is too long to format.\nSelect a shorter passage and try again."
+      transcriptionFeatureLogger.notice(
+        "Skipping formatter arming because selected text exceeded max length"
+      )
       return .none
     }
 
+    state.formatterSession = captureResult.session
+    state.formatterStatusText = captureResult.session == nil ? nil : "Formatter armed"
+    state.formatterErrorText = nil
+    return .none
+  }
+
+  func handleFormatterFlowCompleted(
+    _ state: inout State,
+    formattedText: String,
+    audioURL: URL,
+    duration: TimeInterval
+  ) -> Effect<Action> {
+    state.isTranscribing = false
+    state.isPrewarming = false
+    state.error = nil
+    state.formatterStatusText = nil
+    state.formatterErrorText = nil
     let sourceAppBundleID = state.sourceAppBundleID
     let sourceAppName = state.sourceAppName
     let transcriptionHistory = state.$transcriptionHistory
+    clearFormatterSession(&state)
 
     return .run { send in
       do {
         try await finalizeRecordingAndStoreTranscript(
-          result: modifiedResult,
+          result: formattedText,
           duration: duration,
           sourceAppBundleID: sourceAppBundleID,
           sourceAppName: sourceAppName,
           audioURL: audioURL,
-          transcriptionHistory: transcriptionHistory
+          transcriptionHistory: transcriptionHistory,
+          shouldPasteResult: false
         )
       } catch {
         await send(.transcriptionError(error, audioURL))
       }
     }
     .cancellable(id: CancelID.transcription)
+  }
+
+  func handleFormatterFlowFailed(
+    _ state: inout State,
+    reason: String,
+    audioURL: URL?
+  ) -> Effect<Action> {
+    state.isTranscribing = false
+    state.isPrewarming = false
+    state.error = reason
+    state.formatterStatusText = nil
+    state.formatterErrorText = reason
+    clearFormatterSession(&state)
+
+    if let audioURL {
+      try? FileManager.default.removeItem(at: audioURL)
+    }
+    return .run { send in
+      try? await Task.sleep(for: .seconds(4))
+      await send(.clearFormatterFeedback)
+    }
+    .cancellable(id: CancelID.formatterFeedback, cancelInFlight: true)
   }
 
   func handleTranscriptionError(
@@ -474,6 +709,9 @@ private extension TranscriptionFeature {
     state.isTranscribing = false
     state.isPrewarming = false
     state.error = error.localizedDescription
+    state.formatterStatusText = nil
+    state.formatterErrorText = nil
+    clearFormatterSession(&state)
     
     if let audioURL {
       try? FileManager.default.removeItem(at: audioURL)
@@ -489,7 +727,8 @@ private extension TranscriptionFeature {
     sourceAppBundleID: String?,
     sourceAppName: String?,
     audioURL: URL,
-    transcriptionHistory: Shared<TranscriptionHistory>
+    transcriptionHistory: Shared<TranscriptionHistory>,
+    shouldPasteResult: Bool = true
   ) async throws {
     @Shared(.hexSettings) var hexSettings: HexSettings
 
@@ -519,8 +758,88 @@ private extension TranscriptionFeature {
       try? FileManager.default.removeItem(at: audioURL)
     }
 
-    await pasteboard.paste(result)
+    if shouldPasteResult {
+      await pasteboard.paste(result)
+    }
     soundEffect.play(.pasteTranscript)
+  }
+
+  func clearFormatterSession(_ state: inout State) {
+    state.formatterSession = nil
+  }
+
+  func finalizeStandardTranscription(
+    _ state: inout State,
+    result: String,
+    audioURL: URL,
+    duration: TimeInterval
+  ) -> Effect<Action> {
+    state.isTranscribing = false
+    state.isPrewarming = false
+    state.formatterStatusText = nil
+    state.formatterErrorText = nil
+
+    transcriptionFeatureLogger.info("Raw transcription: '\(result)'")
+    let remappings = state.hexSettings.wordRemappings
+    let removalsEnabled = state.hexSettings.wordRemovalsEnabled
+    let removals = state.hexSettings.wordRemovals
+    let modifiedResult: String
+    if state.isRemappingScratchpadFocused {
+      modifiedResult = result
+      transcriptionFeatureLogger.info("Scratchpad focused; skipping word modifications")
+    } else {
+      var output = result
+      if removalsEnabled {
+        let removedResult = WordRemovalApplier.apply(output, removals: removals)
+        if removedResult != output {
+          let enabledRemovalCount = removals.filter(\.isEnabled).count
+          transcriptionFeatureLogger.info("Applied \(enabledRemovalCount) word removal(s)")
+        }
+        output = removedResult
+      }
+      let remappedResult = WordRemappingApplier.apply(output, remappings: remappings)
+      if remappedResult != output {
+        transcriptionFeatureLogger.info("Applied \(remappings.count) word remapping(s)")
+      }
+      modifiedResult = remappedResult
+    }
+
+    guard !modifiedResult.isEmpty else {
+      clearFormatterSession(&state)
+      return .none
+    }
+
+    let sourceAppBundleID = state.sourceAppBundleID
+    let sourceAppName = state.sourceAppName
+    let transcriptionHistory = state.$transcriptionHistory
+    clearFormatterSession(&state)
+
+    return .run { send in
+      do {
+        try await finalizeRecordingAndStoreTranscript(
+          result: modifiedResult,
+          duration: duration,
+          sourceAppBundleID: sourceAppBundleID,
+          sourceAppName: sourceAppName,
+          audioURL: audioURL,
+          transcriptionHistory: transcriptionHistory
+        )
+      } catch {
+        await send(.transcriptionError(error, audioURL))
+      }
+    }
+    .cancellable(id: CancelID.transcription)
+  }
+
+  func condensedFormatterError(_ error: Error) -> String {
+    if let formattingError = error as? TextFormattingClientError,
+       let description = formattingError.errorDescription
+    {
+      return description
+    }
+
+    let message = error.localizedDescription.trimmingCharacters(in: .whitespacesAndNewlines)
+    return message.isEmpty ? "Formatting failed" : message
   }
 }
 
@@ -531,9 +850,14 @@ private extension TranscriptionFeature {
     state.isTranscribing = false
     state.isRecording = false
     state.isPrewarming = false
+    state.formatterStatusText = nil
+    state.formatterErrorText = nil
+    clearFormatterSession(&state)
 
     return .merge(
       .cancel(id: CancelID.transcription),
+      .cancel(id: CancelID.formatterContextCapture),
+      .cancel(id: CancelID.formatterFeedback),
       .run { [sleepManagement] _ in
         // Allow system to sleep again
         await sleepManagement.allowSleep()
@@ -550,16 +874,23 @@ private extension TranscriptionFeature {
   func handleDiscard(_ state: inout State) -> Effect<Action> {
     state.isRecording = false
     state.isPrewarming = false
+    state.formatterStatusText = nil
+    state.formatterErrorText = nil
+    clearFormatterSession(&state)
 
     // Silently discard - no sound effect
-    return .run { [sleepManagement] _ in
-      // Allow system to sleep again
-      await sleepManagement.allowSleep()
-      let url = await recording.stopRecording()
-      guard !Task.isCancelled else { return }
-      try? FileManager.default.removeItem(at: url)
-    }
-    .cancellable(id: CancelID.recordingCleanup, cancelInFlight: true)
+    return .merge(
+      .cancel(id: CancelID.formatterContextCapture),
+      .cancel(id: CancelID.formatterFeedback),
+      .run { [sleepManagement] _ in
+        // Allow system to sleep again
+        await sleepManagement.allowSleep()
+        let url = await recording.stopRecording()
+        guard !Task.isCancelled else { return }
+        try? FileManager.default.removeItem(at: url)
+      }
+      .cancellable(id: CancelID.recordingCleanup, cancelInFlight: true)
+    )
   }
 }
 
@@ -571,9 +902,16 @@ struct TranscriptionView: View {
 
   var status: TranscriptionIndicatorView.Status {
     if store.isTranscribing {
+      if store.formatterSession != nil {
+        return .formatting
+      }
       return .transcribing
     } else if store.isRecording {
       return .recording
+    } else if store.formatterSession != nil {
+      return .formatterArmed
+    } else if store.formatterErrorText != nil {
+      return .formatterArmed
     } else if store.isPrewarming {
       return .prewarming
     } else {
@@ -584,7 +922,8 @@ struct TranscriptionView: View {
   var body: some View {
     TranscriptionIndicatorView(
       status: status,
-      meter: store.meter
+      meter: store.meter,
+      errorText: store.formatterErrorText
     )
     .task {
       await store.send(.task).finish()
