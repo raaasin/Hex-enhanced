@@ -11,6 +11,8 @@ public enum TextFormattingProvider: String, Codable, CaseIterable, Equatable, Se
 	case openAI
 	case gemini
 
+	public static let availableProviders: [TextFormattingProvider] = [.xAI, .openAI]
+
 	public var displayName: String {
 		switch self {
 		case .xAI:
@@ -19,6 +21,28 @@ public enum TextFormattingProvider: String, Codable, CaseIterable, Equatable, Se
 			return "OpenAI"
 		case .gemini:
 			return "Gemini"
+		}
+	}
+
+	public var defaultBaseURL: String {
+		switch self {
+		case .xAI:
+			return HexSettings.defaultTextFormattingURL
+		case .openAI:
+			return "https://api.openai.com/v1"
+		case .gemini:
+			return "https://generativelanguage.googleapis.com/v1beta/openai"
+		}
+	}
+
+	public var preferredAPIKeyEnvironmentVariables: [String] {
+		switch self {
+		case .xAI:
+			return ["XAI_API_KEY", "OPENAI_API_KEY"]
+		case .openAI:
+			return ["OPENAI_API_KEY", "XAI_API_KEY"]
+		case .gemini:
+			return ["GEMINI_API_KEY", "OPENAI_API_KEY", "XAI_API_KEY"]
 		}
 	}
 }
