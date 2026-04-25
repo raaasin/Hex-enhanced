@@ -95,8 +95,8 @@ class HexAppDelegate: NSObject, NSApplicationDelegate {
 			return
 		}
 		let transcriptionStore = HexApp.appStore.scope(state: \.transcription, action: \.transcription)
-		let transcriptionView = TranscriptionView(store: transcriptionStore).padding().padding(.top).padding(.top)
-			.frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .top)
+		let transcriptionView = TranscriptionView(store: transcriptionStore).padding().padding(.bottom).padding(.bottom)
+			.frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .bottom)
 		invisibleWindow = InvisibleWindow.fromView(transcriptionView)
 		invisibleWindow?.makeKeyAndOrderFront(nil)
 	}

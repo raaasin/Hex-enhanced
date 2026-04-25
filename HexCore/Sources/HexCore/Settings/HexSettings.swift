@@ -6,6 +6,23 @@ public enum RecordingAudioBehavior: String, Codable, CaseIterable, Equatable, Se
 	case doNothing
 }
 
+public enum TextFormattingProvider: String, Codable, CaseIterable, Equatable, Sendable {
+	case xAI
+	case openAI
+	case gemini
+
+	public var displayName: String {
+		switch self {
+		case .xAI:
+			return "xAI"
+		case .openAI:
+			return "OpenAI"
+		case .gemini:
+			return "Gemini"
+		}
+	}
+}
+
 /// User-configurable settings saved to disk.
 public struct HexSettings: Codable, Equatable, Sendable {
 	public static let defaultPasteLastTranscriptHotkey = HotKey(key: .v, modifiers: [.option, .shift])
@@ -16,6 +33,16 @@ public struct HexSettings: Codable, Equatable, Sendable {
 		.init(pattern: "er+"),
 		.init(pattern: "hm+")
 	]
+	public static let defaultTextFormattingURL = "https://api.x.ai/v1"
+	public static let defaultTextFormattingModel = "grok-4-1-fast-non-reasoning"
+	public static let defaultTextFormattingPrompt = """
+	You are an expert writing assistant.
+	Rewrite text according to the user instruction while preserving the original intent.
+	Keep any factual details unless the instruction explicitly asks to change them.
+	Return only the rewritten text, with no preamble.
+	strictly do not use double dashes and always return naturally written text, unless formal is specificed.
+	if prompted for a code rewrite do not return in code blocks or with extra imports be strictly concise.
+	"""
 
 	public static var defaultPasteLastTranscriptHotkeyDescription: String {
 		let modifiers = defaultPasteLastTranscriptHotkey.modifiers.sorted.map { $0.stringValue }.joined()
@@ -47,6 +74,11 @@ public struct HexSettings: Codable, Equatable, Sendable {
 	public var wordRemovalsEnabled: Bool
 	public var wordRemovals: [WordRemoval]
 	public var wordRemappings: [WordRemapping]
+	public var textFormattingProvider: TextFormattingProvider
+	public var textFormattingURL: String
+	public var textFormattingModel: String
+	public var textFormattingAPIKey: String
+	public var textFormattingPrompt: String
 
 	private mutating func normalizeDoubleTapSettings() {
 		if !doubleTapLockEnabled {
@@ -78,7 +110,12 @@ public struct HexSettings: Codable, Equatable, Sendable {
 		hasCompletedStorageMigration: Bool = false,
 		wordRemovalsEnabled: Bool = false,
 		wordRemovals: [WordRemoval] = HexSettings.defaultWordRemovals,
-		wordRemappings: [WordRemapping] = []
+		wordRemappings: [WordRemapping] = [],
+		textFormattingProvider: TextFormattingProvider = .xAI,
+		textFormattingURL: String = HexSettings.defaultTextFormattingURL,
+		textFormattingModel: String = HexSettings.defaultTextFormattingModel,
+		textFormattingAPIKey: String = "",
+		textFormattingPrompt: String = HexSettings.defaultTextFormattingPrompt
 	) {
 		self.soundEffectsEnabled = soundEffectsEnabled
 		self.soundEffectsVolume = soundEffectsVolume
@@ -104,6 +141,11 @@ public struct HexSettings: Codable, Equatable, Sendable {
 		self.wordRemovalsEnabled = wordRemovalsEnabled
 		self.wordRemovals = wordRemovals
 		self.wordRemappings = wordRemappings
+		self.textFormattingProvider = textFormattingProvider
+		self.textFormattingURL = textFormattingURL
+		self.textFormattingModel = textFormattingModel
+		self.textFormattingAPIKey = textFormattingAPIKey
+		self.textFormattingPrompt = textFormattingPrompt
 		normalizeDoubleTapSettings()
 	}
 
@@ -152,6 +194,11 @@ private enum HexSettingKey: String, CodingKey, CaseIterable {
 	case wordRemovalsEnabled
 	case wordRemovals
 	case wordRemappings
+	case textFormattingProvider
+	case textFormattingURL
+	case textFormattingModel
+	case textFormattingAPIKey
+	case textFormattingPrompt
 }
 
 private struct SettingsField<Value: Codable & Sendable> {
@@ -284,6 +331,11 @@ private enum HexSettingsSchema {
 			.wordRemappings,
 			keyPath: \.wordRemappings,
 			default: defaults.wordRemappings
-		).eraseToAny()
+		).eraseToAny(),
+		SettingsField(.textFormattingProvider, keyPath: \.textFormattingProvider, default: defaults.textFormattingProvider).eraseToAny(),
+		SettingsField(.textFormattingURL, keyPath: \.textFormattingURL, default: defaults.textFormattingURL).eraseToAny(),
+		SettingsField(.textFormattingModel, keyPath: \.textFormattingModel, default: defaults.textFormattingModel).eraseToAny(),
+		SettingsField(.textFormattingAPIKey, keyPath: \.textFormattingAPIKey, default: defaults.textFormattingAPIKey).eraseToAny(),
+		SettingsField(.textFormattingPrompt, keyPath: \.textFormattingPrompt, default: defaults.textFormattingPrompt).eraseToAny()
 	]
 }

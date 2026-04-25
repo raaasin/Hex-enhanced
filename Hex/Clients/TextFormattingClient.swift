@@ -1,3 +1,4 @@
+import ComposableArchitecture
 import Dependencies
 import DependenciesMacros
 import Foundation
@@ -8,8 +9,10 @@ private let textFormattingLogger = HexLog.app
 @DependencyClient
 struct TextFormattingClient: Sendable {
   struct Configuration: Equatable, Sendable {
-    var model: String = "grok-4-1-fast-non-reasoning"
-    var baseURL: URL = URL(string: "https://api.x.ai/v1")!
+    var provider: TextFormattingProvider = .xAI
+    var model: String = HexSettings.defaultTextFormattingModel
+    var baseURL: String = HexSettings.defaultTextFormattingURL
+    var prompt: String = HexSettings.defaultTextFormattingPrompt
     var timeout: Duration = .seconds(120)
     var maxOutputTokens: Int = 4096
   }
@@ -24,13 +27,23 @@ extension TextFormattingClient: DependencyKey {
     let live = TextFormattingClientLive()
     return Self(
       format: { original, instruction in
-        try await live.format(original: original, instruction: instruction)
+        @Shared(.hexSettings) var hexSettings: HexSettings
+        let configuration = TextFormattingClient.Configuration(settings: hexSettings)
+        let apiKey = try await live.loadAPIKey(settingsValue: hexSettings.textFormattingAPIKey)
+        return try await live.format(
+          original: original,
+          instruction: instruction,
+          configuration: configuration,
+          apiKey: apiKey
+        )
       },
       loadAPIKey: {
-        try await live.loadAPIKey()
+        @Shared(.hexSettings) var hexSettings: HexSettings
+        return try await live.loadAPIKey(settingsValue: hexSettings.textFormattingAPIKey)
       },
       configuration: {
-        live.configuration
+        @Shared(.hexSettings) var hexSettings: HexSettings
+        return TextFormattingClient.Configuration(settings: hexSettings)
       }
     )
   }()
@@ -60,49 +73,51 @@ enum TextFormattingClientError: LocalizedError, Equatable {
   var errorDescription: String? {
     switch self {
     case .missingAPIKey:
-      return "No API key found. Set XAI_API_KEY (or OPENAI_API_KEY) in your environment or ~/.zshrc."
+      return "No API key found. Add one in Settings > AI, or set XAI_API_KEY / OPENAI_API_KEY / GEMINI_API_KEY in your environment or ~/.zshrc."
     case let .invalidBaseURL(value):
       return "The text formatting service URL is invalid: \(value)."
     case let .transportFailure(message):
-      return "Could not reach xAI. \(message)"
+      return "Could not reach the text formatting provider. \(message)"
     case let .serverError(statusCode, message):
       if let message, !message.isEmpty {
-        return "xAI returned an error (\(statusCode)): \(message)"
+        return "The text formatting provider returned an error (\(statusCode)): \(message)"
       }
-      return "xAI returned an error (\(statusCode))."
+      return "The text formatting provider returned an error (\(statusCode))."
     case .invalidResponse:
-      return "Received an invalid response from xAI."
+      return "Received an invalid response from the text formatting provider."
     case .emptyResponse:
-      return "xAI returned no formatted text."
+      return "The text formatting provider returned no formatted text."
     }
   }
 }
 
 actor TextFormattingClientLive {
-  let configuration = TextFormattingClient.Configuration()
-
   private let urlSession: URLSession = {
     let configuration = URLSessionConfiguration.ephemeral
     configuration.waitsForConnectivity = true
     return URLSession(configuration: configuration)
   }()
 
-  func format(original: String, instruction: String) async throws -> String {
-    let apiKey = try await loadAPIKey()
-    let endpoint = try responsesEndpointURL()
+  func format(
+    original: String,
+    instruction: String,
+    configuration: TextFormattingClient.Configuration,
+    apiKey: String
+  ) async throws -> String {
+    let endpoint = try responsesEndpointURL(baseURL: configuration.baseURL)
 
     textFormattingLogger.info(
-      "Formatting request model=\(self.configuration.model, privacy: .public) originalLength=\(original.count) instructionLength=\(instruction.count)"
+      "Formatting request provider=\(configuration.provider.rawValue, privacy: .public) model=\(configuration.model, privacy: .public) originalLength=\(original.count) instructionLength=\(instruction.count)"
     )
 
     var request = URLRequest(url: endpoint)
     request.httpMethod = "POST"
-    request.timeoutInterval = self.configuration.timeout.timeInterval
+    request.timeoutInterval = configuration.timeout.timeInterval
     request.setValue("application/json", forHTTPHeaderField: "Content-Type")
     request.setValue("Bearer \(apiKey)", forHTTPHeaderField: "Authorization")
 
     request.httpBody = try JSONSerialization.data(
-      withJSONObject: makeRequestBody(original: original, instruction: instruction)
+      withJSONObject: makeRequestBody(original: original, instruction: instruction, configuration: configuration)
     )
 
     let data: Data
@@ -137,13 +152,21 @@ actor TextFormattingClientLive {
     return formatted
   }
 
-  func loadAPIKey() async throws -> String {
+  func loadAPIKey(settingsValue: String) async throws -> String {
+    if let settingsKey = settingsValue.trimmedNonEmpty {
+      return settingsKey
+    }
+
     if let envKey = ProcessInfo.processInfo.environment["XAI_API_KEY"]?.trimmedNonEmpty {
       return envKey
     }
 
     if let fallbackEnvKey = ProcessInfo.processInfo.environment["OPENAI_API_KEY"]?.trimmedNonEmpty {
       return fallbackEnvKey
+    }
+
+    if let geminiEnvKey = ProcessInfo.processInfo.environment["GEMINI_API_KEY"]?.trimmedNonEmpty {
+      return geminiEnvKey
     }
 
     if let zshKey = try loadAPIKeyFromZshrc() {
@@ -153,16 +176,22 @@ actor TextFormattingClientLive {
     throw TextFormattingClientError.missingAPIKey
   }
 
-  private func makeRequestBody(original: String, instruction: String) -> [String: Any] {
-    [
-      "model": self.configuration.model,
+  private func makeRequestBody(
+    original: String,
+    instruction: String,
+    configuration: TextFormattingClient.Configuration
+  ) -> [String: Any] {
+    let prompt = configuration.prompt.trimmedNonEmpty ?? HexSettings.defaultTextFormattingPrompt
+
+    var body: [String: Any] = [
+      "model": configuration.model,
       "input": [
         [
           "role": "system",
           "content": [
             [
               "type": "input_text",
-              "text": TextFormattingPromptBuilder.systemPrompt,
+              "text": prompt,
             ]
           ],
         ],
@@ -176,25 +205,31 @@ actor TextFormattingClientLive {
           ],
         ],
       ],
-      "tools": [
+      "max_output_tokens": configuration.maxOutputTokens,
+    ]
+
+    if configuration.provider == .xAI {
+      body["tools"] = [
         ["type": "web_search"],
         ["type": "x_search"],
-      ],
-      "max_output_tokens": self.configuration.maxOutputTokens,
-    ]
+      ]
+    }
+
+    return body
   }
 
-  private func responsesEndpointURL() throws -> URL {
-    guard var components = URLComponents(url: self.configuration.baseURL, resolvingAgainstBaseURL: false)
+  private func responsesEndpointURL(baseURL: String) throws -> URL {
+    guard let url = URL(string: baseURL),
+          var components = URLComponents(url: url, resolvingAgainstBaseURL: false)
     else {
-      throw TextFormattingClientError.invalidBaseURL(self.configuration.baseURL.absoluteString)
+      throw TextFormattingClientError.invalidBaseURL(baseURL)
     }
 
     let trimmedPath = components.path.trimmingCharacters(in: CharacterSet(charactersIn: "/"))
     components.path = "/\(trimmedPath)/responses".replacingOccurrences(of: "//", with: "/")
 
     guard let url = components.url else {
-      throw TextFormattingClientError.invalidBaseURL(self.configuration.baseURL.absoluteString)
+      throw TextFormattingClientError.invalidBaseURL(baseURL)
     }
 
     return url
@@ -289,7 +324,7 @@ actor TextFormattingClientLive {
     process.executableURL = URL(fileURLWithPath: "/bin/zsh")
     process.arguments = [
       "-lc",
-      "source ~/.zshrc >/dev/null 2>&1; print -r -- ${XAI_API_KEY:-${OPENAI_API_KEY:-}}",
+      "source ~/.zshrc >/dev/null 2>&1; print -r -- ${XAI_API_KEY:-${OPENAI_API_KEY:-${GEMINI_API_KEY:-}}}",
     ]
 
     let outputPipe = Pipe()
@@ -316,6 +351,15 @@ actor TextFormattingClientLive {
     return output
   }
 
+}
+
+private extension TextFormattingClient.Configuration {
+  init(settings: HexSettings) {
+    self.provider = settings.textFormattingProvider
+    self.model = settings.textFormattingModel.trimmedNonEmpty ?? HexSettings.defaultTextFormattingModel
+    self.baseURL = settings.textFormattingURL.trimmedNonEmpty ?? HexSettings.defaultTextFormattingURL
+    self.prompt = settings.textFormattingPrompt
+  }
 }
 
 private extension Duration {

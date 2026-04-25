@@ -193,7 +193,6 @@ struct TranscriptionFeature {
 extension TranscriptionFeature {
   struct FormatterSession: Equatable, Sendable {
     var originalSelection: String
-    var placeholder: String
   }
 
   struct FormatterCaptureResult: Equatable, Sendable {
@@ -203,23 +202,15 @@ extension TranscriptionFeature {
   }
 
   enum FormatterFlowError: LocalizedError, Sendable {
-    case placeholderInsertionFailed
-    case placeholderSelectionFailed
     case formattedReplacementFailed
 
     var errorDescription: String? {
       switch self {
-      case .placeholderInsertionFailed:
-        return "Could not place formatting placeholder"
-      case .placeholderSelectionFailed:
-        return "Could not reselect formatting placeholder"
       case .formattedReplacementFailed:
         return "Could not insert formatted text"
       }
     }
   }
-
-  static let formattingPlaceholder = "[Hex formatting...]"
 }
 
 // MARK: - Effects: Metering & HotKey
@@ -481,8 +472,7 @@ private extension TranscriptionFeature {
         if isWithinMaxLength {
           captureResult = .init(
             session: .init(
-              originalSelection: selectedText,
-              placeholder: Self.formattingPlaceholder
+              originalSelection: selectedText
             ),
             frontmostApp: frontmostApp,
             didExceedMaxLength: false
@@ -552,8 +542,7 @@ private extension TranscriptionFeature {
         if isWithinMaxLength {
           captureResult = .init(
             session: .init(
-              originalSelection: selectedText,
-              placeholder: Self.formattingPlaceholder
+              originalSelection: selectedText
             ),
             frontmostApp: frontmostApp,
             didExceedMaxLength: false
@@ -588,42 +577,20 @@ private extension TranscriptionFeature {
         return
       }
 
-      var insertedPlaceholder = false
       do {
-        insertedPlaceholder = await selectionText.replaceSelectedText(formatterSession.placeholder)
-        guard insertedPlaceholder else {
-          transcriptionFeatureLogger.notice(
-            "Formatter placeholder insertion failed before flow start; falling back to normal paste flow"
-          )
-          await send(.formatterFlowFallbackToTranscription(result, audioURL, duration))
-          return
-        }
-
         let formatted = try await textFormatting.format(
           formatterSession.originalSelection,
           instruction
         )
 
-        let didReselectPlaceholder = await selectionText.selectLeftCharacters(formatterSession.placeholder.count)
-        guard didReselectPlaceholder else {
-          throw FormatterFlowError.placeholderSelectionFailed
-        }
-
-        let didReplacePlaceholder = await selectionText.replaceSelectedText(formatted)
-        guard didReplacePlaceholder else {
+        let didReplaceSelection = await selectionText.replaceSelectedText(formatted)
+        if !didReplaceSelection {
           throw FormatterFlowError.formattedReplacementFailed
         }
 
         transcriptionFeatureLogger.notice("Formatting flow completed with output length \(formatted.count)")
         await send(.formatterFlowCompleted(formatted, audioURL, duration))
       } catch {
-        if insertedPlaceholder {
-          _ = await selectionText.selectLeftCharacters(formatterSession.placeholder.count)
-        }
-        let didRestoreOriginal = await selectionText.replaceSelectedText(formatterSession.originalSelection)
-        if !didRestoreOriginal {
-          transcriptionFeatureLogger.error("Formatting failed and original selection restore also failed")
-        }
         transcriptionFeatureLogger.error("Formatting flow failed: \(error.localizedDescription)")
         await send(.formatterFlowFailed(condensedFormatterError(error), audioURL))
       }

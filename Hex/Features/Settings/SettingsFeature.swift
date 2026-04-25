@@ -84,6 +84,11 @@ struct SettingsFeature {
     case setSelectedMicrophoneID(String?)
     case setSoundEffectsEnabled(Bool)
     case setSoundEffectsVolume(Double)
+    case setTextFormattingProvider(TextFormattingProvider)
+    case setTextFormattingURL(String)
+    case setTextFormattingModel(String)
+    case setTextFormattingAPIKey(String)
+    case setTextFormattingPrompt(String)
 
     // Permission delegation (forwarded to AppFeature)
     case requestMicrophone
@@ -506,6 +511,26 @@ struct SettingsFeature {
 
       case let .setSoundEffectsVolume(volume):
         state.$hexSettings.withLock { $0.soundEffectsVolume = volume }
+        return .none
+
+      case let .setTextFormattingProvider(provider):
+        state.$hexSettings.withLock { $0.textFormattingProvider = provider }
+        return .none
+
+      case let .setTextFormattingURL(url):
+        state.$hexSettings.withLock { $0.textFormattingURL = url }
+        return .none
+
+      case let .setTextFormattingModel(model):
+        state.$hexSettings.withLock { $0.textFormattingModel = model }
+        return .none
+
+      case let .setTextFormattingAPIKey(apiKey):
+        state.$hexSettings.withLock { $0.textFormattingAPIKey = apiKey }
+        return .none
+
+      case let .setTextFormattingPrompt(prompt):
+        state.$hexSettings.withLock { $0.textFormattingPrompt = prompt }
         return .none
 
       // Permission requests

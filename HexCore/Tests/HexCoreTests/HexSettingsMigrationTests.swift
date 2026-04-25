@@ -25,6 +25,11 @@ final class HexSettingsMigrationTests: XCTestCase {
 		XCTAssertEqual(decoded.maxHistoryEntries, 10)
 		XCTAssertEqual(decoded.hasCompletedModelBootstrap, true)
 		XCTAssertEqual(decoded.hasCompletedStorageMigration, true)
+		XCTAssertEqual(decoded.textFormattingProvider, .xAI)
+		XCTAssertEqual(decoded.textFormattingURL, HexSettings.defaultTextFormattingURL)
+		XCTAssertEqual(decoded.textFormattingModel, HexSettings.defaultTextFormattingModel)
+		XCTAssertEqual(decoded.textFormattingAPIKey, "")
+		XCTAssertEqual(decoded.textFormattingPrompt, HexSettings.defaultTextFormattingPrompt)
 	}
 
 	func testEncodeDecodeRoundTripPreservesDefaults() throws {
