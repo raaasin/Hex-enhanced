@@ -29,7 +29,10 @@ extension TextFormattingClient: DependencyKey {
       format: { original, instruction in
         @Shared(.hexSettings) var hexSettings: HexSettings
         let configuration = TextFormattingClient.Configuration(settings: hexSettings)
-        let apiKey = try await live.loadAPIKey(settingsValue: hexSettings.textFormattingAPIKey)
+        let apiKey = try await live.loadAPIKey(
+          settingsValue: hexSettings.textFormattingAPIKey,
+          provider: configuration.provider
+        )
         return try await live.format(
           original: original,
           instruction: instruction,
@@ -39,7 +42,11 @@ extension TextFormattingClient: DependencyKey {
       },
       loadAPIKey: {
         @Shared(.hexSettings) var hexSettings: HexSettings
-        return try await live.loadAPIKey(settingsValue: hexSettings.textFormattingAPIKey)
+        let configuration = TextFormattingClient.Configuration(settings: hexSettings)
+        return try await live.loadAPIKey(
+          settingsValue: hexSettings.textFormattingAPIKey,
+          provider: configuration.provider
+        )
       },
       configuration: {
         @Shared(.hexSettings) var hexSettings: HexSettings
@@ -63,7 +70,7 @@ extension DependencyValues {
 }
 
 enum TextFormattingClientError: LocalizedError, Equatable {
-  case missingAPIKey
+  case missingAPIKey(provider: TextFormattingProvider)
   case invalidBaseURL(String)
   case transportFailure(String)
   case serverError(statusCode: Int, message: String?)
@@ -72,8 +79,9 @@ enum TextFormattingClientError: LocalizedError, Equatable {
 
   var errorDescription: String? {
     switch self {
-    case .missingAPIKey:
-      return "No API key found. Add one in Settings > AI, or set XAI_API_KEY / OPENAI_API_KEY / GEMINI_API_KEY in your environment or ~/.zshrc."
+    case let .missingAPIKey(provider):
+      let envVars = provider.preferredAPIKeyEnvironmentVariables.joined(separator: " / ")
+      return "No \(provider.displayName) API key found. Add one in Settings > AI, or set \(envVars) in your environment or ~/.zshrc."
     case let .invalidBaseURL(value):
       return "The text formatting service URL is invalid: \(value)."
     case let .transportFailure(message):
@@ -152,28 +160,22 @@ actor TextFormattingClientLive {
     return formatted
   }
 
-  func loadAPIKey(settingsValue: String) async throws -> String {
+  func loadAPIKey(settingsValue: String, provider: TextFormattingProvider) async throws -> String {
     if let settingsKey = settingsValue.trimmedNonEmpty {
       return settingsKey
     }
 
-    if let envKey = ProcessInfo.processInfo.environment["XAI_API_KEY"]?.trimmedNonEmpty {
-      return envKey
+    for envVar in provider.preferredAPIKeyEnvironmentVariables {
+      if let envKey = ProcessInfo.processInfo.environment[envVar]?.trimmedNonEmpty {
+        return envKey
+      }
     }
 
-    if let fallbackEnvKey = ProcessInfo.processInfo.environment["OPENAI_API_KEY"]?.trimmedNonEmpty {
-      return fallbackEnvKey
-    }
-
-    if let geminiEnvKey = ProcessInfo.processInfo.environment["GEMINI_API_KEY"]?.trimmedNonEmpty {
-      return geminiEnvKey
-    }
-
-    if let zshKey = try loadAPIKeyFromZshrc() {
+    if let zshKey = try loadAPIKeyFromZshrc(preferredEnvironmentVariables: provider.preferredAPIKeyEnvironmentVariables) {
       return zshKey
     }
 
-    throw TextFormattingClientError.missingAPIKey
+    throw TextFormattingClientError.missingAPIKey(provider: provider)
   }
 
   private func makeRequestBody(
@@ -319,12 +321,16 @@ actor TextFormattingClientLive {
     return fragments
   }
 
-  private func loadAPIKeyFromZshrc() throws -> String? {
+  private func loadAPIKeyFromZshrc(preferredEnvironmentVariables: [String]) throws -> String? {
+    let joinedVariableFallbacks = preferredEnvironmentVariables
+      .map { "${\($0):-" }
+      .joined() + String(repeating: "}", count: preferredEnvironmentVariables.count)
+
     let process = Process()
     process.executableURL = URL(fileURLWithPath: "/bin/zsh")
     process.arguments = [
       "-lc",
-      "source ~/.zshrc >/dev/null 2>&1; print -r -- ${XAI_API_KEY:-${OPENAI_API_KEY:-${GEMINI_API_KEY:-}}}",
+      "source ~/.zshrc >/dev/null 2>&1; print -r -- \(joinedVariableFallbacks)",
     ]
 
     let outputPipe = Pipe()
@@ -355,9 +361,13 @@ actor TextFormattingClientLive {
 
 private extension TextFormattingClient.Configuration {
   init(settings: HexSettings) {
-    self.provider = settings.textFormattingProvider
+    let provider = TextFormattingProvider.availableProviders.contains(settings.textFormattingProvider)
+      ? settings.textFormattingProvider
+      : .xAI
+
+    self.provider = provider
     self.model = settings.textFormattingModel.trimmedNonEmpty ?? HexSettings.defaultTextFormattingModel
-    self.baseURL = settings.textFormattingURL.trimmedNonEmpty ?? HexSettings.defaultTextFormattingURL
+    self.baseURL = provider.defaultBaseURL
     self.prompt = settings.textFormattingPrompt
   }
 }

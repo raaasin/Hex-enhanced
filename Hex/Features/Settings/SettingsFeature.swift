@@ -514,7 +514,10 @@ struct SettingsFeature {
         return .none
 
       case let .setTextFormattingProvider(provider):
-        state.$hexSettings.withLock { $0.textFormattingProvider = provider }
+        state.$hexSettings.withLock {
+          $0.textFormattingProvider = provider
+          $0.textFormattingURL = provider.defaultBaseURL
+        }
         return .none
 
       case let .setTextFormattingURL(url):

@@ -14,27 +14,18 @@ struct AISettingsView: View {
           Picker(
             "Provider",
             selection: Binding(
-              get: { store.hexSettings.textFormattingProvider },
+              get: {
+                let provider = store.hexSettings.textFormattingProvider
+                return TextFormattingProvider.availableProviders.contains(provider) ? provider : .xAI
+              },
               set: { store.send(.setTextFormattingProvider($0)) }
             )
           ) {
-            ForEach(TextFormattingProvider.allCases, id: \.self) { provider in
+            ForEach(TextFormattingProvider.availableProviders, id: \.self) { provider in
               Text(provider.displayName).tag(provider)
             }
           }
           .labelsHidden()
-        }
-
-        VStack(alignment: .leading, spacing: 6) {
-          Text("Provider URL")
-          TextField(
-            "https://api.x.ai/v1",
-            text: Binding(
-              get: { store.hexSettings.textFormattingURL },
-              set: { store.send(.setTextFormattingURL($0)) }
-            )
-          )
-          .textFieldStyle(.roundedBorder)
         }
 
         VStack(alignment: .leading, spacing: 6) {
