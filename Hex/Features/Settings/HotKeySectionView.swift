@@ -42,12 +42,13 @@ struct HotKeySectionView: View {
 
             Label {
                 Toggle(
-                    "Enable double-tap lock",
+                    "Enable legacy double-tap lock",
                     isOn: Binding(
                         get: { store.hexSettings.doubleTapLockEnabled },
                         set: { store.send(.setDoubleTapLockEnabled($0)) }
                     )
                 )
+                Text("Off by default. Re-enable the old tap-tap lock behavior if you still want it.")
             } icon: {
                 Image(systemName: "hand.tap")
             }

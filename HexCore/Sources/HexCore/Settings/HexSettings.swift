@@ -43,6 +43,11 @@ public struct HexSettings: Codable, Equatable, Sendable {
 	strictly do not use double dashes and always return naturally written text, unless formal is specificed.
 	if prompted for a code rewrite do not return in code blocks or with extra imports be strictly concise.
 	"""
+	public static let defaultAskPrompt = """
+	You answer the user's spoken question directly and concisely.
+	Return only the answer with no preamble.
+	If code is the clearest answer, do not wrap it in markdown fences.
+	"""
 
 	public static var defaultPasteLastTranscriptHotkeyDescription: String {
 		let modifiers = defaultPasteLastTranscriptHotkey.modifiers.sorted.map { $0.stringValue }.joined()
@@ -79,6 +84,8 @@ public struct HexSettings: Codable, Equatable, Sendable {
 	public var textFormattingModel: String
 	public var textFormattingAPIKey: String
 	public var textFormattingPrompt: String
+	public var askModeEnabled: Bool
+	public var askModePrompt: String
 
 	private mutating func normalizeDoubleTapSettings() {
 		if !doubleTapLockEnabled {
@@ -100,7 +107,7 @@ public struct HexSettings: Codable, Equatable, Sendable {
 		copyToClipboard: Bool = false,
 		superFastModeEnabled: Bool = false,
 		useDoubleTapOnly: Bool = false,
-		doubleTapLockEnabled: Bool = true,
+		doubleTapLockEnabled: Bool = false,
 		outputLanguage: String? = nil,
 		selectedMicrophoneID: String? = nil,
 		saveTranscriptionHistory: Bool = true,
@@ -115,7 +122,9 @@ public struct HexSettings: Codable, Equatable, Sendable {
 		textFormattingURL: String = HexSettings.defaultTextFormattingURL,
 		textFormattingModel: String = HexSettings.defaultTextFormattingModel,
 		textFormattingAPIKey: String = "",
-		textFormattingPrompt: String = HexSettings.defaultTextFormattingPrompt
+		textFormattingPrompt: String = HexSettings.defaultTextFormattingPrompt,
+		askModeEnabled: Bool = true,
+		askModePrompt: String = HexSettings.defaultAskPrompt
 	) {
 		self.soundEffectsEnabled = soundEffectsEnabled
 		self.soundEffectsVolume = soundEffectsVolume
@@ -146,6 +155,8 @@ public struct HexSettings: Codable, Equatable, Sendable {
 		self.textFormattingModel = textFormattingModel
 		self.textFormattingAPIKey = textFormattingAPIKey
 		self.textFormattingPrompt = textFormattingPrompt
+		self.askModeEnabled = askModeEnabled
+		self.askModePrompt = askModePrompt
 		normalizeDoubleTapSettings()
 	}
 
@@ -199,6 +210,8 @@ private enum HexSettingKey: String, CodingKey, CaseIterable {
 	case textFormattingModel
 	case textFormattingAPIKey
 	case textFormattingPrompt
+	case askModeEnabled
+	case askModePrompt
 }
 
 private struct SettingsField<Value: Codable & Sendable> {
@@ -285,7 +298,23 @@ private enum HexSettingsSchema {
 		SettingsField(.copyToClipboard, keyPath: \.copyToClipboard, default: defaults.copyToClipboard).eraseToAny(),
 		SettingsField(.superFastModeEnabled, keyPath: \.superFastModeEnabled, default: defaults.superFastModeEnabled).eraseToAny(),
 		SettingsField(.useDoubleTapOnly, keyPath: \.useDoubleTapOnly, default: defaults.useDoubleTapOnly).eraseToAny(),
-		SettingsField(.doubleTapLockEnabled, keyPath: \.doubleTapLockEnabled, default: defaults.doubleTapLockEnabled).eraseToAny(),
+		SettingsField(
+			.doubleTapLockEnabled,
+			keyPath: \.doubleTapLockEnabled,
+			default: defaults.doubleTapLockEnabled,
+			decode: { container, key, defaultValue in
+				if let value = try container.decodeIfPresent(Bool.self, forKey: key) {
+					return value
+				}
+
+				// Before `doubleTapLockEnabled` existed, `useDoubleTapOnly` implied lock mode was on.
+				if try container.decodeIfPresent(Bool.self, forKey: .useDoubleTapOnly) == true {
+					return true
+				}
+
+				return defaultValue
+			}
+		).eraseToAny(),
 		SettingsField(
 			.outputLanguage,
 			keyPath: \.outputLanguage,
@@ -336,6 +365,8 @@ private enum HexSettingsSchema {
 		SettingsField(.textFormattingURL, keyPath: \.textFormattingURL, default: defaults.textFormattingURL).eraseToAny(),
 		SettingsField(.textFormattingModel, keyPath: \.textFormattingModel, default: defaults.textFormattingModel).eraseToAny(),
 		SettingsField(.textFormattingAPIKey, keyPath: \.textFormattingAPIKey, default: defaults.textFormattingAPIKey).eraseToAny(),
-		SettingsField(.textFormattingPrompt, keyPath: \.textFormattingPrompt, default: defaults.textFormattingPrompt).eraseToAny()
+		SettingsField(.textFormattingPrompt, keyPath: \.textFormattingPrompt, default: defaults.textFormattingPrompt).eraseToAny(),
+		SettingsField(.askModeEnabled, keyPath: \.askModeEnabled, default: defaults.askModeEnabled).eraseToAny(),
+		SettingsField(.askModePrompt, keyPath: \.askModePrompt, default: defaults.askModePrompt).eraseToAny()
 	]
 }

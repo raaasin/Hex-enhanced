@@ -18,6 +18,7 @@ struct TextFormattingClient: Sendable {
   }
 
   var format: @Sendable (_ original: String, _ instruction: String) async throws -> String
+  var ask: @Sendable (_ question: String) async throws -> String
   var loadAPIKey: @Sendable () async throws -> String
   var configuration: @Sendable () -> Configuration = { .init() }
 }
@@ -37,6 +38,16 @@ extension TextFormattingClient: DependencyKey {
           apiKey: apiKey
         )
       },
+      ask: { question in
+        @Shared(.hexSettings) var hexSettings: HexSettings
+        let configuration = TextFormattingClient.Configuration(askSettings: hexSettings)
+        let apiKey = try await live.loadAPIKey(settingsValue: hexSettings.textFormattingAPIKey)
+        return try await live.ask(
+          question: question,
+          configuration: configuration,
+          apiKey: apiKey
+        )
+      },
       loadAPIKey: {
         @Shared(.hexSettings) var hexSettings: HexSettings
         return try await live.loadAPIKey(settingsValue: hexSettings.textFormattingAPIKey)
@@ -50,6 +61,7 @@ extension TextFormattingClient: DependencyKey {
 
   static let testValue = Self(
     format: { _, _ in "" },
+    ask: { _ in "" },
     loadAPIKey: { "" },
     configuration: { .init() }
   )
@@ -104,10 +116,40 @@ actor TextFormattingClientLive {
     configuration: TextFormattingClient.Configuration,
     apiKey: String
   ) async throws -> String {
+    try await performRequest(
+      requestBody: makeFormatRequestBody(original: original, instruction: instruction, configuration: configuration),
+      configuration: configuration,
+      apiKey: apiKey,
+      requestKind: "format",
+      inputLength: original.count + instruction.count
+    )
+  }
+
+  func ask(
+    question: String,
+    configuration: TextFormattingClient.Configuration,
+    apiKey: String
+  ) async throws -> String {
+    try await performRequest(
+      requestBody: makeAskRequestBody(question: question, configuration: configuration),
+      configuration: configuration,
+      apiKey: apiKey,
+      requestKind: "ask",
+      inputLength: question.count
+    )
+  }
+
+  private func performRequest(
+    requestBody: [String: Any],
+    configuration: TextFormattingClient.Configuration,
+    apiKey: String,
+    requestKind: String,
+    inputLength: Int
+  ) async throws -> String {
     let endpoint = try responsesEndpointURL(baseURL: configuration.baseURL)
 
     textFormattingLogger.info(
-      "Formatting request provider=\(configuration.provider.rawValue, privacy: .public) model=\(configuration.model, privacy: .public) originalLength=\(original.count) instructionLength=\(instruction.count)"
+      "AI request type=\(requestKind, privacy: .public) provider=\(configuration.provider.rawValue, privacy: .public) model=\(configuration.model, privacy: .public) inputLength=\(inputLength)"
     )
 
     var request = URLRequest(url: endpoint)
@@ -116,9 +158,7 @@ actor TextFormattingClientLive {
     request.setValue("application/json", forHTTPHeaderField: "Content-Type")
     request.setValue("Bearer \(apiKey)", forHTTPHeaderField: "Authorization")
 
-    request.httpBody = try JSONSerialization.data(
-      withJSONObject: makeRequestBody(original: original, instruction: instruction, configuration: configuration)
-    )
+    request.httpBody = try JSONSerialization.data(withJSONObject: requestBody)
 
     let data: Data
     let response: URLResponse
@@ -181,7 +221,7 @@ actor TextFormattingClientLive {
     throw TextFormattingClientError.missingAPIKey
   }
 
-  private func makeRequestBody(
+  private func makeFormatRequestBody(
     original: String,
     instruction: String,
     configuration: TextFormattingClient.Configuration
@@ -206,6 +246,47 @@ actor TextFormattingClientLive {
             [
               "type": "input_text",
               "text": TextFormattingPromptBuilder.userPrompt(original: original, instruction: instruction),
+            ]
+          ],
+        ],
+      ],
+      "max_output_tokens": configuration.maxOutputTokens,
+    ]
+
+    if configuration.provider == .xAI {
+      body["tools"] = [
+        ["type": "web_search"],
+        ["type": "x_search"],
+      ]
+    }
+
+    return body
+  }
+
+  private func makeAskRequestBody(
+    question: String,
+    configuration: TextFormattingClient.Configuration
+  ) -> [String: Any] {
+    let prompt = configuration.prompt.trimmedNonEmpty ?? HexSettings.defaultAskPrompt
+
+    var body: [String: Any] = [
+      "model": configuration.model,
+      "input": [
+        [
+          "role": "system",
+          "content": [
+            [
+              "type": "input_text",
+              "text": prompt,
+            ]
+          ],
+        ],
+        [
+          "role": "user",
+          "content": [
+            [
+              "type": "input_text",
+              "text": question,
             ]
           ],
         ],
@@ -384,6 +465,13 @@ private extension TextFormattingClient.Configuration {
     self.model = settings.textFormattingModel.trimmedNonEmpty ?? HexSettings.defaultTextFormattingModel
     self.baseURL = settings.textFormattingURL.trimmedNonEmpty ?? HexSettings.defaultTextFormattingURL
     self.prompt = settings.textFormattingPrompt
+  }
+
+  init(askSettings settings: HexSettings) {
+    self.provider = settings.textFormattingProvider
+    self.model = settings.textFormattingModel.trimmedNonEmpty ?? HexSettings.defaultTextFormattingModel
+    self.baseURL = settings.textFormattingURL.trimmedNonEmpty ?? HexSettings.defaultTextFormattingURL
+    self.prompt = settings.askModePrompt
   }
 }
 

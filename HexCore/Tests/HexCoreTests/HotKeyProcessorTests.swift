@@ -413,9 +413,23 @@ struct HotKeyProcessorTests {
                 // First release
                 ScenarioStep(time: 0.1, key: nil, modifiers: [], expectedOutput: .stopRecording, expectedIsMatched: false),
                 // Second tap within threshold - should start a new recording but not lock yet
-                ScenarioStep(time: 0.2, key: nil, modifiers: [.option], expectedOutput: .startRecording, expectedIsMatched: true, expectedState: .pressAndHold(startTime: Date(timeIntervalSince1970: 0.2))),
+                ScenarioStep(time: 0.2, key: nil, modifiers: [.option], expectedOutput: .startRecording, expectedIsMatched: true, expectedState: .pressAndHold(startTime: Date(timeIntervalSince1970: 0.2), mode: .dictation)),
                 // Second release - NOW it should lock
                 ScenarioStep(time: 0.3, key: nil, modifiers: [], expectedOutput: nil, expectedIsMatched: true, expectedState: .doubleTapLock),
+            ]
+        )
+    }
+
+    @Test
+    func modifierOnly_tapThenTapAndHold_startsAskMode() throws {
+        runScenario(
+            hotkey: HotKey(key: nil, modifiers: [.option]),
+            askModeEnabled: true,
+            steps: [
+                ScenarioStep(time: 0.0, key: nil, modifiers: [.option], expectedOutput: .startRecording, expectedIsMatched: true),
+                ScenarioStep(time: 0.1, key: nil, modifiers: [], expectedOutput: .stopRecording, expectedIsMatched: false),
+                ScenarioStep(time: 0.2, key: nil, modifiers: [.option], expectedOutput: .startAskRecording, expectedIsMatched: true, expectedState: .pressAndHold(startTime: Date(timeIntervalSince1970: 0.2), mode: .ask)),
+                ScenarioStep(time: 0.6, key: nil, modifiers: [], expectedOutput: .stopRecording, expectedIsMatched: false),
             ]
         )
     }
@@ -640,6 +654,7 @@ func runScenario(
     hotkey: HotKey,
     useDoubleTapOnly: Bool = false,
     doubleTapLockEnabled: Bool = true,
+    askModeEnabled: Bool = false,
     steps: [ScenarioStep]
 ) {
     // Sort steps by time, just in case they're not in ascending order
@@ -655,7 +670,8 @@ func runScenario(
         HotKeyProcessor(
             hotkey: hotkey,
             useDoubleTapOnly: useDoubleTapOnly,
-            doubleTapLockEnabled: doubleTapLockEnabled
+            doubleTapLockEnabled: doubleTapLockEnabled,
+            askModeEnabled: askModeEnabled
         )
     }
 
@@ -793,7 +809,7 @@ struct MouseClickTests {
         var processor = withDependencies {
             $0.date.now = Date(timeIntervalSince1970: 0)
         } operation: {
-            HotKeyProcessor(hotkey: HotKey(key: nil, modifiers: [.option]), minimumKeyTime: 0.15)
+            HotKeyProcessor(hotkey: HotKey(key: nil, modifiers: [.option]), askModeEnabled: false, minimumKeyTime: 0.15)
         }
         
         // Start recording with modifier-only hotkey
@@ -818,7 +834,7 @@ struct MouseClickTests {
         var processor = withDependencies {
             $0.date.now = Date(timeIntervalSince1970: 0)
         } operation: {
-            HotKeyProcessor(hotkey: HotKey(key: nil, modifiers: [.option]), minimumKeyTime: 0.15)
+            HotKeyProcessor(hotkey: HotKey(key: nil, modifiers: [.option]), askModeEnabled: false, minimumKeyTime: 0.15)
         }
         
         // Start recording with modifier-only hotkey
@@ -843,7 +859,7 @@ struct MouseClickTests {
         var processor = withDependencies {
             $0.date.now = Date(timeIntervalSince1970: 0)
         } operation: {
-            HotKeyProcessor(hotkey: HotKey(key: nil, modifiers: [.option]), minimumKeyTime: 0.15)
+            HotKeyProcessor(hotkey: HotKey(key: nil, modifiers: [.option]), askModeEnabled: false, minimumKeyTime: 0.15)
         }
         
         // First tap
@@ -887,7 +903,7 @@ struct MouseClickTests {
         var processor = withDependencies {
             $0.date.now = Date(timeIntervalSince1970: 0)
         } operation: {
-            HotKeyProcessor(hotkey: HotKey(key: .a, modifiers: [.command]), minimumKeyTime: 0.15)
+            HotKeyProcessor(hotkey: HotKey(key: .a, modifiers: [.command]), askModeEnabled: false, minimumKeyTime: 0.15)
         }
         
         // Start recording with key+modifier hotkey
@@ -912,7 +928,7 @@ struct MouseClickTests {
         var processor = withDependencies {
             $0.date.now = Date(timeIntervalSince1970: 0)
         } operation: {
-            HotKeyProcessor(hotkey: HotKey(key: nil, modifiers: [.option]), minimumKeyTime: 0.5)
+            HotKeyProcessor(hotkey: HotKey(key: nil, modifiers: [.option]), askModeEnabled: false, minimumKeyTime: 0.5)
         }
         
         // Start recording with modifier-only hotkey

@@ -30,6 +30,8 @@ final class HexSettingsMigrationTests: XCTestCase {
 		XCTAssertEqual(decoded.textFormattingModel, HexSettings.defaultTextFormattingModel)
 		XCTAssertEqual(decoded.textFormattingAPIKey, "")
 		XCTAssertEqual(decoded.textFormattingPrompt, HexSettings.defaultTextFormattingPrompt)
+		XCTAssertTrue(decoded.askModeEnabled)
+		XCTAssertEqual(decoded.askModePrompt, HexSettings.defaultAskPrompt)
 	}
 
 	func testEncodeDecodeRoundTripPreservesDefaults() throws {
@@ -67,6 +69,14 @@ final class HexSettingsMigrationTests: XCTestCase {
 		XCTAssertFalse(settings.useDoubleTapOnly)
 		XCTAssertFalse(decoded.useDoubleTapOnly)
 		XCTAssertEqual(decoded, settings)
+	}
+
+	func testDefaultsUseAskModeAndLegacyLockDisabled() {
+		let settings = HexSettings()
+
+		XCTAssertTrue(settings.askModeEnabled)
+		XCTAssertEqual(settings.askModePrompt, HexSettings.defaultAskPrompt)
+		XCTAssertFalse(settings.doubleTapLockEnabled)
 	}
 
 	private func loadFixture(named name: String) throws -> Data {

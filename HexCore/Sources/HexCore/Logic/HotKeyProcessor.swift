@@ -101,6 +101,9 @@ public struct HotKeyProcessor {
     /// If false, the quick double-tap lock gesture is disabled.
     /// Press-and-hold still works normally.
     public var doubleTapLockEnabled: Bool = true
+
+    /// If true, modifier-only hotkeys can enter one-shot Ask mode via tap, then tap-and-hold.
+    public var askModeEnabled: Bool = true
     
     /// Minimum duration before very quick taps are considered valid
     /// For modifier-only hotkeys, this is overridden to 0.3s minimum
@@ -140,11 +143,13 @@ public struct HotKeyProcessor {
         hotkey: HotKey,
         useDoubleTapOnly: Bool = false,
         doubleTapLockEnabled: Bool = true,
+        askModeEnabled: Bool = true,
         minimumKeyTime: TimeInterval = HexCoreConstants.defaultMinimumKeyTime
     ) {
         self.hotkey = hotkey
         self.useDoubleTapOnly = useDoubleTapOnly
         self.doubleTapLockEnabled = doubleTapLockEnabled
+        self.askModeEnabled = askModeEnabled
         self.minimumKeyTime = minimumKeyTime
     }
 
@@ -229,7 +234,7 @@ public struct HotKeyProcessor {
         switch state {
         case .idle:
             return nil
-        case let .pressAndHold(startTime):
+        case let .pressAndHold(startTime, _):
             // Mouse click during modifier-only recording
             let elapsed = now.timeIntervalSince(startTime)
             // For modifier-only hotkeys, use the same threshold as RecordingDecisionEngine
@@ -257,12 +262,17 @@ public struct HotKeyProcessor {
 public extension HotKeyProcessor {
     /// Represents the current state of hotkey detection
     enum State: Equatable {
+        public enum RecordingMode: Equatable {
+            case dictation
+            case ask
+        }
+
         /// Idle, waiting for hotkey activation
         case idle
         
         /// Press-and-hold recording active
         /// - Parameter startTime: When the hotkey was first pressed (for duration calculation)
-        case pressAndHold(startTime: Date)
+        case pressAndHold(startTime: Date, mode: RecordingMode)
         
         /// Double-tap lock active - recording continues until explicit stop
         case doubleTapLock
@@ -272,6 +282,9 @@ public extension HotKeyProcessor {
     enum Output: Equatable {
         /// Begin a new recording session
         case startRecording
+
+        /// Begin a one-shot Ask recording session
+        case startAskRecording
         
         /// Stop the current recording and process audio
         case stopRecording
@@ -316,8 +329,17 @@ extension HotKeyProcessor {
                 lastTapAt = now
                 return nil
             } else {
+                if hotkey.key == nil,
+                   askModeEnabled,
+                   let previousTap = lastTapAt,
+                   now.timeIntervalSince(previousTap) < Self.doubleTapThreshold
+                {
+                    state = .pressAndHold(startTime: now, mode: .ask)
+                    return .startAskRecording
+                }
+
                 // Normal press => .pressAndHold => .startRecording
-                state = .pressAndHold(startTime: now)
+                state = .pressAndHold(startTime: now, mode: .dictation)
                 return .startRecording
             }
 
@@ -373,9 +395,15 @@ extension HotKeyProcessor {
             }
             return nil
 
-        case let .pressAndHold(startTime):
+        case let .pressAndHold(startTime, mode):
             // If user truly "released" the chord => either normal stop or doubleTapLock
             if isReleaseForActiveHotkey(e) {
+                if mode == .ask {
+                    state = .idle
+                    lastTapAt = nil
+                    return .stopRecording
+                }
+
                 // Check if this release is close to the prior release => double-tap lock
                 if doubleTapLockEnabled,
                    let prevReleaseTime = lastTapAt,

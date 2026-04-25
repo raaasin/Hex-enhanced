@@ -89,6 +89,8 @@ struct SettingsFeature {
     case setTextFormattingModel(String)
     case setTextFormattingAPIKey(String)
     case setTextFormattingPrompt(String)
+    case setAskModeEnabled(Bool)
+    case setAskModePrompt(String)
 
     // Permission delegation (forwarded to AppFeature)
     case requestMicrophone
@@ -531,6 +533,14 @@ struct SettingsFeature {
 
       case let .setTextFormattingPrompt(prompt):
         state.$hexSettings.withLock { $0.textFormattingPrompt = prompt }
+        return .none
+
+      case let .setAskModeEnabled(enabled):
+        state.$hexSettings.withLock { $0.askModeEnabled = enabled }
+        return .none
+
+      case let .setAskModePrompt(prompt):
+        state.$hexSettings.withLock { $0.askModePrompt = prompt }
         return .none
 
       // Permission requests

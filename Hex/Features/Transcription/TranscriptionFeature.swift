@@ -19,6 +19,7 @@ private let transcriptionFeatureLogger = HexLog.transcription
 struct TranscriptionFeature {
   @ObservableState
   struct State {
+    var recordingMode: RecordingMode = .dictation
     var isRecording: Bool = false
     var isTranscribing: Bool = false
     var isPrewarming: Bool = false
@@ -30,6 +31,8 @@ struct TranscriptionFeature {
     var formatterSession: FormatterSession?
     var formatterStatusText: String?
     var formatterErrorText: String?
+    var askAnswerText: String?
+    var askErrorText: String?
     @Shared(.hexSettings) var hexSettings: HexSettings
     @Shared(.isRemappingScratchpadFocused) var isRemappingScratchpadFocused: Bool = false
     @Shared(.modelBootstrapState) var modelBootstrapState: ModelBootstrapState
@@ -46,6 +49,7 @@ struct TranscriptionFeature {
 
     // Recording flow
     case startRecording
+    case startAskRecording
     case stopRecording
     case captureFormatterContext
     case formatterContextCaptured(FormatterCaptureResult)
@@ -61,6 +65,9 @@ struct TranscriptionFeature {
     case formatterFlowFailed(String, URL?)
     case formatterFlowFallbackToTranscription(String, URL, TimeInterval)
     case clearFormatterFeedback
+    case askResponseReceived(String, URL)
+    case askResponseFailed(String, URL?)
+    case clearAskFeedback
 
     // Model availability
     case modelMissing
@@ -122,7 +129,10 @@ struct TranscriptionFeature {
       // MARK: - Recording Flow
 
       case .startRecording:
-        return handleStartRecording(&state)
+        return handleStartRecording(&state, mode: .dictation)
+
+      case .startAskRecording:
+        return handleStartRecording(&state, mode: .ask)
 
       case .stopRecording:
         return handleStopRecording(&state)
@@ -167,6 +177,17 @@ struct TranscriptionFeature {
         state.formatterErrorText = nil
         return .none
 
+      case let .askResponseReceived(answer, audioURL):
+        return handleAskResponseReceived(&state, answer: answer, audioURL: audioURL)
+
+      case let .askResponseFailed(reason, audioURL):
+        return handleAskResponseFailed(&state, reason: reason, audioURL: audioURL)
+
+      case .clearAskFeedback:
+        state.askAnswerText = nil
+        state.askErrorText = nil
+        return .none
+
       case .modelMissing:
         return .none
 
@@ -191,6 +212,11 @@ struct TranscriptionFeature {
 }
 
 extension TranscriptionFeature {
+  enum RecordingMode: Equatable, Sendable {
+    case dictation
+    case ask
+  }
+
   struct FormatterSession: Equatable, Sendable {
     var originalSelection: String
   }
@@ -245,6 +271,7 @@ private extension TranscriptionFeature {
         let useDoubleTapOnly = hexSettings.doubleTapLockEnabled && hexSettings.useDoubleTapOnly
         hotKeyProcessor.doubleTapLockEnabled = hexSettings.doubleTapLockEnabled
         hotKeyProcessor.useDoubleTapOnly = useDoubleTapOnly
+        hotKeyProcessor.askModeEnabled = hexSettings.askModeEnabled
         hotKeyProcessor.minimumKeyTime = hexSettings.minimumKeyTime
 
         switch inputEvent {
@@ -269,6 +296,10 @@ private extension TranscriptionFeature {
             // If the hotkey is purely modifiers, return false to keep it from interfering with normal usage
             // But if useDoubleTapOnly is true, always intercept the key
             return useDoubleTapOnly || keyEvent.key != nil
+
+          case .startAskRecording:
+            Task { await send(.startAskRecording) }
+            return true
 
           case .stopRecording:
             Task { await send(.hotKeyReleased) }
@@ -302,7 +333,7 @@ private extension TranscriptionFeature {
           case .discard:
             Task { await send(.discard) }
             return false // Don't intercept the click itself
-          case .startRecording, .stopRecording, .none:
+          case .startRecording, .startAskRecording, .stopRecording, .none:
             return false
           }
         }
@@ -346,19 +377,22 @@ private extension TranscriptionFeature {
 // MARK: - Recording Handlers
 
 private extension TranscriptionFeature {
-  func handleStartRecording(_ state: inout State) -> Effect<Action> {
+  func handleStartRecording(_ state: inout State, mode: RecordingMode) -> Effect<Action> {
     guard state.modelBootstrapState.isModelReady else {
       return .merge(
         .send(.modelMissing),
         .run { _ in soundEffect.play(.cancel) }
       )
     }
+    state.recordingMode = mode
     state.isRecording = true
     let startTime = now
     state.recordingStartTime = startTime
     state.formatterSession = nil
     state.formatterStatusText = nil
     state.formatterErrorText = nil
+    state.askAnswerText = nil
+    state.askErrorText = nil
     
     // Capture the active application
     if let activeApp = NSWorkspace.shared.frontmostApplication {
@@ -510,6 +544,7 @@ private extension TranscriptionFeature {
     if ForceQuitCommandDetector.matches(result) {
       state.isTranscribing = false
       state.isPrewarming = false
+      state.recordingMode = .dictation
       clearFormatterSession(&state)
       transcriptionFeatureLogger.fault("Force quit voice command recognized; terminating Hex.")
       return .run { _ in
@@ -524,8 +559,26 @@ private extension TranscriptionFeature {
     guard !result.isEmpty else {
       state.isTranscribing = false
       state.isPrewarming = false
+      state.recordingMode = .dictation
       state.formatterStatusText = nil
       return .none
+    }
+
+    if state.recordingMode == .ask {
+      state.formatterSession = nil
+      state.formatterStatusText = "Thinking"
+      state.formatterErrorText = nil
+
+      return .run { send in
+        do {
+          let answer = try await textFormatting.ask(result)
+          await send(.askResponseReceived(answer, audioURL))
+        } catch {
+          transcriptionFeatureLogger.error("Ask flow failed: \(error.localizedDescription)")
+          await send(.askResponseFailed(condensedFormatterError(error), audioURL))
+        }
+      }
+      .cancellable(id: CancelID.transcription)
     }
 
     let duration = state.recordingStartTime.map { Date().timeIntervalSince($0) } ?? 0
@@ -645,6 +698,7 @@ private extension TranscriptionFeature {
   ) -> Effect<Action> {
     state.isTranscribing = false
     state.isPrewarming = false
+    state.recordingMode = .dictation
     state.error = nil
     state.formatterStatusText = nil
     state.formatterErrorText = nil
@@ -678,6 +732,7 @@ private extension TranscriptionFeature {
   ) -> Effect<Action> {
     state.isTranscribing = false
     state.isPrewarming = false
+    state.recordingMode = .dictation
     state.error = reason
     state.formatterStatusText = nil
     state.formatterErrorText = reason
@@ -700,11 +755,57 @@ private extension TranscriptionFeature {
   ) -> Effect<Action> {
     state.isTranscribing = false
     state.isPrewarming = false
+    state.recordingMode = .dictation
     state.error = error.localizedDescription
     state.formatterStatusText = nil
     state.formatterErrorText = nil
     clearFormatterSession(&state)
     
+    if let audioURL {
+      try? FileManager.default.removeItem(at: audioURL)
+    }
+
+    return .none
+  }
+
+  func handleAskResponseReceived(
+    _ state: inout State,
+    answer: String,
+    audioURL: URL
+  ) -> Effect<Action> {
+    state.isTranscribing = false
+    state.isPrewarming = false
+    state.error = nil
+    state.formatterStatusText = nil
+    state.formatterErrorText = nil
+    state.askErrorText = nil
+    state.askAnswerText = answer
+    state.recordingMode = .dictation
+    clearFormatterSession(&state)
+
+    return .run { _ in
+      await pasteboard.copy(answer)
+      try? FileManager.default.removeItem(at: audioURL)
+      soundEffect.play(.pasteTranscript)
+    }
+    .cancellable(id: CancelID.transcription)
+  }
+
+  func handleAskResponseFailed(
+    _ state: inout State,
+    reason: String,
+    audioURL: URL?
+  ) -> Effect<Action> {
+    state.isTranscribing = false
+    state.isPrewarming = false
+    state.error = reason
+    state.formatterStatusText = nil
+    state.formatterErrorText = nil
+    state.askAnswerText = nil
+    state.askErrorText = reason
+    state.recordingMode = .dictation
+    clearFormatterSession(&state)
+
     if let audioURL {
       try? FileManager.default.removeItem(at: audioURL)
     }
@@ -768,6 +869,7 @@ private extension TranscriptionFeature {
   ) -> Effect<Action> {
     state.isTranscribing = false
     state.isPrewarming = false
+    state.recordingMode = .dictation
     state.formatterStatusText = nil
     state.formatterErrorText = nil
 
@@ -842,6 +944,7 @@ private extension TranscriptionFeature {
     state.isTranscribing = false
     state.isRecording = false
     state.isPrewarming = false
+    state.recordingMode = .dictation
     state.formatterStatusText = nil
     state.formatterErrorText = nil
     clearFormatterSession(&state)
@@ -866,6 +969,7 @@ private extension TranscriptionFeature {
   func handleDiscard(_ state: inout State) -> Effect<Action> {
     state.isRecording = false
     state.isPrewarming = false
+    state.recordingMode = .dictation
     state.formatterStatusText = nil
     state.formatterErrorText = nil
     clearFormatterSession(&state)
@@ -893,7 +997,15 @@ struct TranscriptionView: View {
   @ObserveInjection var inject
 
   var status: TranscriptionIndicatorView.Status {
-    if store.isTranscribing {
+    if store.recordingMode == .ask && store.isRecording {
+      return .askRecording
+    } else if store.recordingMode == .ask && store.isTranscribing {
+      return .askThinking
+    } else if store.askErrorText != nil {
+      return .askError
+    } else if store.askAnswerText != nil {
+      return .askAnswer
+    } else if store.isTranscribing {
       if store.formatterSession != nil {
         return .formatting
       }
@@ -915,7 +1027,8 @@ struct TranscriptionView: View {
     TranscriptionIndicatorView(
       status: status,
       meter: store.meter,
-      errorText: store.formatterErrorText
+      errorText: store.formatterErrorText,
+      askText: store.askErrorText ?? store.askAnswerText ?? (status == .askThinking ? "Thinking..." : nil)
     )
     .task {
       await store.send(.task).finish()

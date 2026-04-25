@@ -9,6 +9,19 @@ struct AISettingsView: View {
   var body: some View {
     Form {
       Section("AI") {
+        Label {
+          Toggle(
+            "Enable Ask mode",
+            isOn: Binding(
+              get: { store.hexSettings.askModeEnabled },
+              set: { store.send(.setAskModeEnabled($0)) }
+            )
+          )
+          Text("Use tap, then tap-and-hold on modifier-only hotkeys to ask a one-shot question.")
+        } icon: {
+          Image(systemName: "bubble.left.and.exclamationmark.bubble.right.fill")
+        }
+
         VStack(alignment: .leading, spacing: 6) {
           Text("Provider")
           Picker(
@@ -66,6 +79,15 @@ struct AISettingsView: View {
           TextEditor(text: Binding(
             get: { store.hexSettings.textFormattingPrompt },
             set: { store.send(.setTextFormattingPrompt($0)) }
+          ))
+          .frame(minHeight: 140)
+        }
+
+        VStack(alignment: .leading, spacing: 6) {
+          Text("Ask prompt")
+          TextEditor(text: Binding(
+            get: { store.hexSettings.askModePrompt },
+            set: { store.send(.setAskModePrompt($0)) }
           ))
           .frame(minHeight: 140)
         }
