@@ -144,7 +144,12 @@ actor TextFormattingClientLive {
       throw TextFormattingClientError.invalidResponse
     }
 
-    guard let formatted = parseFormattedText(from: responseObject), !formatted.isEmpty else {
+    guard let parsed = parseFormattedText(from: responseObject) else {
+      throw TextFormattingClientError.emptyResponse
+    }
+
+    let formatted = Self.sanitizeOuterMarkdownFence(in: parsed)
+    guard !formatted.isEmpty else {
       throw TextFormattingClientError.emptyResponse
     }
 
@@ -288,6 +293,26 @@ actor TextFormattingClientLive {
     }
 
     return nil
+  }
+
+  nonisolated static func sanitizeOuterMarkdownFence(in text: String) -> String {
+    guard text.hasPrefix("```") else { return text }
+    guard let openingFenceLineBreak = text.firstIndex(of: "\n") else { return text }
+    let openingFenceInfo = text[text.index(text.startIndex, offsetBy: 3)..<openingFenceLineBreak]
+    guard !openingFenceInfo.contains("`") else { return text }
+
+    let remainder = text[text.index(after: openingFenceLineBreak)...]
+    guard remainder.hasSuffix("\n```") else { return text }
+
+    let innerCodeEnd = remainder.index(remainder.endIndex, offsetBy: -4)
+    var innerCode = String(remainder[..<innerCodeEnd])
+    guard !innerCode.hasPrefix("```") else { return text }
+    guard !innerCode.contains("\n```") else { return text }
+    guard !innerCode.contains("\r\n```") else { return text }
+    if innerCode.hasSuffix("\r") {
+      innerCode.removeLast()
+    }
+    return innerCode
   }
 
   private func extractContentFragments(from content: Any?) -> [String] {
