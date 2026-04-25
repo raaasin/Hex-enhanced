@@ -65,6 +65,7 @@ struct TranscriptionFeature {
     case formatterFlowFailed(String, URL?)
     case formatterFlowFallbackToTranscription(String, URL, TimeInterval)
     case clearFormatterFeedback
+    case askResponseUpdated(String)
     case askResponseReceived(String, URL)
     case askResponseFailed(String, URL?)
     case clearAskFeedback
@@ -175,6 +176,12 @@ struct TranscriptionFeature {
       case .clearFormatterFeedback:
         state.formatterStatusText = nil
         state.formatterErrorText = nil
+        return .none
+
+      case let .askResponseUpdated(answer):
+        state.askAnswerText = answer
+        state.askErrorText = nil
+        state.error = nil
         return .none
 
       case let .askResponseReceived(answer, audioURL):
@@ -571,7 +578,19 @@ private extension TranscriptionFeature {
 
       return .run { send in
         do {
-          let answer = try await textFormatting.ask(result)
+          let stream = try await textFormatting.askStream(result)
+          var finalAnswer = ""
+
+          for try await answer in stream {
+            finalAnswer = answer
+            await send(.askResponseUpdated(answer))
+          }
+
+          let answer = finalAnswer.trimmingCharacters(in: .whitespacesAndNewlines)
+          guard !answer.isEmpty else {
+            throw TextFormattingClientError.emptyResponse
+          }
+
           await send(.askResponseReceived(answer, audioURL))
         } catch {
           transcriptionFeatureLogger.error("Ask flow failed: \(error.localizedDescription)")
@@ -941,12 +960,17 @@ private extension TranscriptionFeature {
 
 private extension TranscriptionFeature {
   func handleCancel(_ state: inout State) -> Effect<Action> {
+    let shouldClearAskFeedback = state.recordingMode == .ask
     state.isTranscribing = false
     state.isRecording = false
     state.isPrewarming = false
     state.recordingMode = .dictation
     state.formatterStatusText = nil
     state.formatterErrorText = nil
+    if shouldClearAskFeedback {
+      state.askAnswerText = nil
+      state.askErrorText = nil
+    }
     clearFormatterSession(&state)
 
     return .merge(
@@ -967,11 +991,16 @@ private extension TranscriptionFeature {
   }
 
   func handleDiscard(_ state: inout State) -> Effect<Action> {
+    let shouldClearAskFeedback = state.recordingMode == .ask
     state.isRecording = false
     state.isPrewarming = false
     state.recordingMode = .dictation
     state.formatterStatusText = nil
     state.formatterErrorText = nil
+    if shouldClearAskFeedback {
+      state.askAnswerText = nil
+      state.askErrorText = nil
+    }
     clearFormatterSession(&state)
 
     // Silently discard - no sound effect

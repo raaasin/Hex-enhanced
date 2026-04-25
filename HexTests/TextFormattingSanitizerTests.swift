@@ -54,4 +54,37 @@ struct TextFormattingSanitizerTests {
 
     #expect(TextFormattingClientLive.sanitizeOuterMarkdownFence(in: value) == value)
   }
+
+  @Test
+  func askStreamParserAppendsDeltaSnapshots() {
+    let update = TextFormattingClientLive.parseAskStreamEvent(
+      eventName: "response.output_text.delta",
+      data: #"{"type":"response.output_text.delta","delta":"Hello"}"#,
+      currentText: ""
+    )
+
+    #expect(update == .snapshot("Hello"))
+  }
+
+  @Test
+  func askStreamParserPrefersCompletedResponseSnapshot() {
+    let update = TextFormattingClientLive.parseAskStreamEvent(
+      eventName: "response.completed",
+      data: #"{"type":"response.completed","output_text":"Hello world"}"#,
+      currentText: "Hello"
+    )
+
+    #expect(update == .snapshot("Hello world"))
+  }
+
+  @Test
+  func askStreamParserRecognizesDoneSentinel() {
+    let update = TextFormattingClientLive.parseAskStreamEvent(
+      eventName: nil,
+      data: "[DONE]",
+      currentText: "Hello"
+    )
+
+    #expect(update == .finished)
+  }
 }

@@ -19,6 +19,7 @@ struct TextFormattingClient: Sendable {
 
   var format: @Sendable (_ original: String, _ instruction: String) async throws -> String
   var ask: @Sendable (_ question: String) async throws -> String
+  var askStream: @Sendable (_ question: String) async throws -> AsyncThrowingStream<String, Error>
   var loadAPIKey: @Sendable () async throws -> String
   var configuration: @Sendable () -> Configuration = { .init() }
 }
@@ -48,6 +49,16 @@ extension TextFormattingClient: DependencyKey {
           apiKey: apiKey
         )
       },
+      askStream: { question in
+        @Shared(.hexSettings) var hexSettings: HexSettings
+        let configuration = TextFormattingClient.Configuration(askSettings: hexSettings)
+        let apiKey = try await live.loadAPIKey(settingsValue: hexSettings.textFormattingAPIKey)
+        return try await live.askStream(
+          question: question,
+          configuration: configuration,
+          apiKey: apiKey
+        )
+      },
       loadAPIKey: {
         @Shared(.hexSettings) var hexSettings: HexSettings
         return try await live.loadAPIKey(settingsValue: hexSettings.textFormattingAPIKey)
@@ -62,6 +73,11 @@ extension TextFormattingClient: DependencyKey {
   static let testValue = Self(
     format: { _, _ in "" },
     ask: { _ in "" },
+    askStream: { _ in
+      AsyncThrowingStream { continuation in
+        continuation.finish()
+      }
+    },
     loadAPIKey: { "" },
     configuration: { .init() }
   )
@@ -139,6 +155,145 @@ actor TextFormattingClientLive {
     )
   }
 
+  func askStream(
+    question: String,
+    configuration: TextFormattingClient.Configuration,
+    apiKey: String
+  ) async throws -> AsyncThrowingStream<String, Error> {
+    if configuration.provider != .xAI {
+      let answer = try await ask(
+        question: question,
+        configuration: configuration,
+        apiKey: apiKey
+      )
+      return AsyncThrowingStream { continuation in
+        continuation.yield(answer)
+        continuation.finish()
+      }
+    }
+
+    let endpoint = try responsesEndpointURL(baseURL: configuration.baseURL)
+    var requestBody = makeAskRequestBody(question: question, configuration: configuration)
+    requestBody["stream"] = true
+
+    textFormattingLogger.info(
+      "AI request type=ask-stream provider=\(configuration.provider.rawValue, privacy: .public) model=\(configuration.model, privacy: .public) inputLength=\(question.count)"
+    )
+
+    return AsyncThrowingStream { continuation in
+      let task = Task {
+        do {
+          let request = try Self.makeRequest(
+            endpoint: endpoint,
+            requestBody: requestBody,
+            configuration: configuration,
+            apiKey: apiKey
+          )
+
+          let (bytes, response) = try await urlSession.bytes(for: request)
+
+          guard let httpResponse = response as? HTTPURLResponse else {
+            throw TextFormattingClientError.invalidResponse
+          }
+
+          guard (200 ..< 300).contains(httpResponse.statusCode) else {
+            let errorData = try await Self.readData(from: bytes)
+            throw TextFormattingClientError.serverError(
+              statusCode: httpResponse.statusCode,
+              message: Self.parseErrorMessage(from: errorData)
+            )
+          }
+
+          var accumulatedText = ""
+          var lastYieldedText = ""
+          var eventName: String?
+          var dataLines: [String] = []
+
+          for try await rawLine in bytes.lines {
+            if rawLine.isEmpty {
+              switch Self.parseAskStreamEvent(
+                eventName: eventName,
+                data: dataLines.joined(separator: "\n"),
+                currentText: accumulatedText
+              ) {
+              case let .snapshot(snapshot):
+                accumulatedText = snapshot
+                let sanitizedSnapshot = Self.sanitizeOuterMarkdownFence(in: snapshot)
+                guard sanitizedSnapshot != lastYieldedText else {
+                  eventName = nil
+                  dataLines.removeAll(keepingCapacity: true)
+                  continue
+                }
+                lastYieldedText = sanitizedSnapshot
+                continuation.yield(sanitizedSnapshot)
+              case let .failure(message):
+                throw TextFormattingClientError.serverError(statusCode: httpResponse.statusCode, message: message)
+              case .finished, .none:
+                break
+              }
+
+              eventName = nil
+              dataLines.removeAll(keepingCapacity: true)
+              continue
+            }
+
+            if rawLine.hasPrefix(":") {
+              continue
+            }
+
+            if rawLine.hasPrefix("event:") {
+              eventName = Self.sseFieldValue(in: rawLine, prefix: "event:")
+              continue
+            }
+
+            if rawLine.hasPrefix("data:") {
+              dataLines.append(Self.sseFieldValue(in: rawLine, prefix: "data:"))
+            }
+          }
+
+          switch Self.parseAskStreamEvent(
+            eventName: eventName,
+            data: dataLines.joined(separator: "\n"),
+            currentText: accumulatedText
+          ) {
+          case let .snapshot(snapshot):
+            accumulatedText = snapshot
+            let sanitizedSnapshot = Self.sanitizeOuterMarkdownFence(in: snapshot)
+            if sanitizedSnapshot != lastYieldedText {
+              continuation.yield(sanitizedSnapshot)
+              lastYieldedText = sanitizedSnapshot
+            }
+          case let .failure(message):
+            throw TextFormattingClientError.serverError(statusCode: httpResponse.statusCode, message: message)
+          case .finished, .none:
+            break
+          }
+
+          let finalAnswer = Self.sanitizeOuterMarkdownFence(in: accumulatedText).trimmed
+          guard !finalAnswer.isEmpty else {
+            throw TextFormattingClientError.emptyResponse
+          }
+
+          if finalAnswer != lastYieldedText {
+            continuation.yield(finalAnswer)
+          }
+          textFormattingLogger.debug("Ask stream response length=\(finalAnswer.count)")
+          continuation.finish()
+        } catch let error as TextFormattingClientError {
+          continuation.finish(throwing: error)
+        } catch is CancellationError {
+          continuation.finish()
+        } catch {
+          continuation.finish(throwing: TextFormattingClientError.transportFailure(error.localizedDescription))
+        }
+      }
+
+      continuation.onTermination = { _ in
+        task.cancel()
+      }
+    }
+  }
+
   private func performRequest(
     requestBody: [String: Any],
     configuration: TextFormattingClient.Configuration,
@@ -152,13 +307,12 @@ actor TextFormattingClientLive {
       "AI request type=\(requestKind, privacy: .public) provider=\(configuration.provider.rawValue, privacy: .public) model=\(configuration.model, privacy: .public) inputLength=\(inputLength)"
     )
 
-    var request = URLRequest(url: endpoint)
-    request.httpMethod = "POST"
-    request.timeoutInterval = configuration.timeout.timeInterval
-    request.setValue("application/json", forHTTPHeaderField: "Content-Type")
-    request.setValue("Bearer \(apiKey)", forHTTPHeaderField: "Authorization")
-
-    request.httpBody = try JSONSerialization.data(withJSONObject: requestBody)
+    let request = try Self.makeRequest(
+      endpoint: endpoint,
+      requestBody: requestBody,
+      configuration: configuration,
+      apiKey: apiKey
+    )
 
     let data: Data
     let response: URLResponse
@@ -175,7 +329,7 @@ actor TextFormattingClientLive {
     guard (200 ..< 300).contains(httpResponse.statusCode) else {
       throw TextFormattingClientError.serverError(
         statusCode: httpResponse.statusCode,
-        message: parseErrorMessage(from: data)
+        message: Self.parseErrorMessage(from: data)
       )
     }
 
@@ -184,7 +338,7 @@ actor TextFormattingClientLive {
       throw TextFormattingClientError.invalidResponse
     }
 
-    guard let parsed = parseFormattedText(from: responseObject) else {
+    guard let parsed = Self.parseFormattedText(from: responseObject) else {
       throw TextFormattingClientError.emptyResponse
     }
 
@@ -321,7 +475,30 @@ actor TextFormattingClientLive {
     return url
   }
 
-  private func parseErrorMessage(from data: Data) -> String? {
+  private static func makeRequest(
+    endpoint: URL,
+    requestBody: [String: Any],
+    configuration: TextFormattingClient.Configuration,
+    apiKey: String
+  ) throws -> URLRequest {
+    var request = URLRequest(url: endpoint)
+    request.httpMethod = "POST"
+    request.timeoutInterval = configuration.timeout.timeInterval
+    request.setValue("application/json", forHTTPHeaderField: "Content-Type")
+    request.setValue("Bearer \(apiKey)", forHTTPHeaderField: "Authorization")
+    request.httpBody = try JSONSerialization.data(withJSONObject: requestBody)
+    return request
+  }
+
+  private static func readData(from bytes: URLSession.AsyncBytes) async throws -> Data {
+    var data = Data()
+    for try await byte in bytes {
+      data.append(byte)
+    }
+    return data
+  }
+
+  private static func parseErrorMessage(from data: Data) -> String? {
     guard
       let jsonObject = try? JSONSerialization.jsonObject(with: data),
       let responseObject = jsonObject as? [String: Any]
@@ -340,7 +517,7 @@ actor TextFormattingClientLive {
     return nil
   }
 
-  private func parseFormattedText(from response: [String: Any]) -> String? {
+  private static func parseFormattedText(from response: [String: Any]) -> String? {
     if let outputText = response["output_text"] as? String, !outputText.trimmed.isEmpty {
       return outputText.trimmed
     }
@@ -396,7 +573,7 @@ actor TextFormattingClientLive {
     return innerCode
   }
 
-  private func extractContentFragments(from content: Any?) -> [String] {
+  private static func extractContentFragments(from content: Any?) -> [String] {
     guard let content else { return [] }
 
     if let stringValue = content as? String {
@@ -423,6 +600,83 @@ actor TextFormattingClientLive {
     }
 
     return fragments
+  }
+
+  enum AskStreamEventUpdate: Equatable {
+    case snapshot(String)
+    case finished
+    case failure(String?)
+  }
+
+  nonisolated static func parseAskStreamEvent(
+    eventName: String?,
+    data: String,
+    currentText: String
+  ) -> AskStreamEventUpdate? {
+    let payload = data.trimmed
+    guard !payload.isEmpty else { return nil }
+    if payload == "[DONE]" {
+      return .finished
+    }
+
+    guard
+      let jsonData = payload.data(using: .utf8),
+      let jsonObject = try? JSONSerialization.jsonObject(with: jsonData),
+      let responseObject = jsonObject as? [String: Any]
+    else {
+      return nil
+    }
+
+    if let error = responseObject["error"] as? [String: Any] {
+      return .failure(error["message"] as? String)
+    }
+
+    let type = (responseObject["type"] as? String) ?? eventName
+
+    switch type {
+    case "error":
+      return .failure(responseObject["message"] as? String)
+
+    case "response.output_text.delta":
+      guard let delta = responseObject["delta"] as? String, !delta.isEmpty else {
+        return nil
+      }
+      return .snapshot(currentText + delta)
+
+    case "response.output_text.done":
+      if let text = responseObject["text"] as? String, !text.isEmpty {
+        return .snapshot(mergedStreamText(currentText: currentText, incomingText: text))
+      }
+      return nil
+
+    case "response.completed":
+      if let outputText = parseFormattedText(from: responseObject), !outputText.isEmpty {
+        return .snapshot(outputText)
+      }
+      return .finished
+
+    default:
+      if let outputText = parseFormattedText(from: responseObject), !outputText.isEmpty {
+        return .snapshot(mergedStreamText(currentText: currentText, incomingText: outputText))
+      }
+      return nil
+    }
+  }
+
+  private nonisolated static func mergedStreamText(currentText: String, incomingText: String) -> String {
+    if incomingText.hasPrefix(currentText) {
+      return incomingText
+    }
+    if currentText.hasPrefix(incomingText) {
+      return currentText
+    }
+    return currentText + incomingText
+  }
+
+  private nonisolated static func sseFieldValue(in line: String, prefix: String) -> String {
+    let startIndex = line.index(line.startIndex, offsetBy: prefix.count)
+    let value = line[startIndex...]
+    return value.first == " " ? String(value.dropFirst()) : String(value)
   }
 
   private func loadAPIKeyFromZshrc() throws -> String? {
