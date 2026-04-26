@@ -93,10 +93,10 @@ extension DependencyValues {
 enum TextFormattingClientError: LocalizedError, Equatable {
   case missingAPIKey
   case invalidBaseURL(String)
-  case transportFailure(String)
-  case serverError(statusCode: Int, message: String?)
+  case transportFailure(String, debugContext: String? = nil)
+  case serverError(statusCode: Int, message: String?, debugContext: String? = nil)
   case invalidResponse
-  case emptyResponse
+  case emptyResponse(debugContext: String? = nil)
 
   var errorDescription: String? {
     switch self {
@@ -104,17 +104,51 @@ enum TextFormattingClientError: LocalizedError, Equatable {
       return "No API key found. Add one in Settings > AI, or set XAI_API_KEY / OPENAI_API_KEY / GEMINI_API_KEY in your environment or ~/.zshrc."
     case let .invalidBaseURL(value):
       return "The text formatting service URL is invalid: \(value)."
-    case let .transportFailure(message):
-      return "Could not reach the text formatting provider. \(message)"
-    case let .serverError(statusCode, message):
+    case let .transportFailure(message, debugContext):
+      return askStreamErrorDescription(
+        headline: "Could not reach the text formatting provider. \(message)",
+        debugContext: debugContext
+      )
+    case let .serverError(statusCode, message, debugContext):
       if let message, !message.isEmpty {
-        return "The text formatting provider returned an error (\(statusCode)): \(message)"
+        return askStreamErrorDescription(
+          headline: "The text formatting provider returned an error (\(statusCode)): \(message)",
+          debugContext: debugContext
+        )
       }
-      return "The text formatting provider returned an error (\(statusCode))."
+      return askStreamErrorDescription(
+        headline: "The text formatting provider returned an error (\(statusCode)).",
+        debugContext: debugContext
+      )
     case .invalidResponse:
       return "Received an invalid response from the text formatting provider."
-    case .emptyResponse:
-      return "The text formatting provider returned no formatted text."
+    case let .emptyResponse(debugContext):
+      return askStreamErrorDescription(
+        headline: "The text formatting provider returned no formatted text.",
+        debugContext: debugContext
+      )
+    }
+  }
+
+  private func askStreamErrorDescription(headline: String, debugContext: String?) -> String {
+    guard let debugContext, !debugContext.isEmpty else {
+      return headline
+    }
+    return "\(headline)\n\nAsk stream diagnostics:\n\(debugContext)"
+  }
+
+  func attachingDebugContextIfNeeded(_ debugContext: String?) -> Self {
+    guard let debugContext, !debugContext.isEmpty else { return self }
+
+    switch self {
+    case let .transportFailure(message, existingDebugContext):
+      return .transportFailure(message, debugContext: existingDebugContext ?? debugContext)
+    case let .serverError(statusCode, message, existingDebugContext):
+      return .serverError(statusCode: statusCode, message: message, debugContext: existingDebugContext ?? debugContext)
+    case let .emptyResponse(existingDebugContext):
+      return .emptyResponse(debugContext: existingDebugContext ?? debugContext)
+    default:
+      return self
     }
   }
 }
@@ -182,6 +216,12 @@ actor TextFormattingClientLive {
 
     return AsyncThrowingStream { continuation in
       let task = Task {
+        var diagnostics = AskStreamDiagnostics(
+          provider: configuration.provider.rawValue,
+          model: configuration.model,
+          endpoint: endpoint.absoluteString
+        )
+
         do {
           let request = try Self.makeRequest(
             endpoint: endpoint,
@@ -196,11 +236,15 @@ actor TextFormattingClientLive {
             throw TextFormattingClientError.invalidResponse
           }
 
+          diagnostics.httpStatusCode = httpResponse.statusCode
+
           guard (200 ..< 300).contains(httpResponse.statusCode) else {
             let errorData = try await Self.readData(from: bytes)
+            diagnostics.recordHTTPFailure(body: String(data: errorData, encoding: .utf8))
             throw TextFormattingClientError.serverError(
               statusCode: httpResponse.statusCode,
-              message: Self.parseErrorMessage(from: errorData)
+              message: Self.parseErrorMessage(from: errorData),
+              debugContext: diagnostics.render()
             )
           }
 
@@ -210,68 +254,66 @@ actor TextFormattingClientLive {
           var dataLines: [String] = []
 
           for try await rawLine in bytes.lines {
-            if rawLine.isEmpty {
-              switch Self.parseAskStreamEvent(
-                eventName: eventName,
-                data: dataLines.joined(separator: "\n"),
-                currentText: accumulatedText
-              ) {
-              case let .snapshot(snapshot):
-                accumulatedText = snapshot
-                let sanitizedSnapshot = Self.sanitizeOuterMarkdownFence(in: snapshot)
-                guard sanitizedSnapshot != lastYieldedText else {
-                  eventName = nil
-                  dataLines.removeAll(keepingCapacity: true)
-                  continue
-                }
-                lastYieldedText = sanitizedSnapshot
-                continuation.yield(sanitizedSnapshot)
-              case let .failure(message):
-                throw TextFormattingClientError.serverError(statusCode: httpResponse.statusCode, message: message)
-              case .finished, .none:
-                break
+            let line = Self.normalizedSSELine(rawLine)
+            textFormattingLogger.debug("SSE raw line: '\(rawLine)' -> normalized: '\(line)'")
+
+            if line.trimmed.isEmpty {
+              textFormattingLogger.debug("Event boundary detected")
+              try Self.dispatchAskStreamEvent(
+                eventName: &eventName,
+                dataLines: &dataLines,
+                accumulatedText: &accumulatedText,
+                lastYieldedText: &lastYieldedText,
+                diagnostics: &diagnostics,
+                statusCode: httpResponse.statusCode,
+                continuation: continuation
+              )
+              continue
+            }
+
+            if line.hasPrefix(":") {
+              continue
+            }
+
+            if line.hasPrefix("event:") {
+              if eventName != nil || !dataLines.isEmpty {
+                textFormattingLogger.debug("Dispatching buffered event before next event header")
+                try Self.dispatchAskStreamEvent(
+                  eventName: &eventName,
+                  dataLines: &dataLines,
+                  accumulatedText: &accumulatedText,
+                  lastYieldedText: &lastYieldedText,
+                  diagnostics: &diagnostics,
+                  statusCode: httpResponse.statusCode,
+                  continuation: continuation
+                )
               }
-
-              eventName = nil
-              dataLines.removeAll(keepingCapacity: true)
+              eventName = Self.sseFieldValue(in: line, prefix: "event:")
+              textFormattingLogger.debug("Parsed event name: \(eventName ?? "none")")
               continue
             }
 
-            if rawLine.hasPrefix(":") {
-              continue
-            }
-
-            if rawLine.hasPrefix("event:") {
-              eventName = Self.sseFieldValue(in: rawLine, prefix: "event:")
-              continue
-            }
-
-            if rawLine.hasPrefix("data:") {
-              dataLines.append(Self.sseFieldValue(in: rawLine, prefix: "data:"))
+            if line.hasPrefix("data:") {
+              let dataValue = Self.sseFieldValue(in: line, prefix: "data:")
+              dataLines.append(dataValue)
+              textFormattingLogger.debug("Added data line: '\(dataValue)'")
             }
           }
 
-          switch Self.parseAskStreamEvent(
-            eventName: eventName,
-            data: dataLines.joined(separator: "\n"),
-            currentText: accumulatedText
-          ) {
-          case let .snapshot(snapshot):
-            accumulatedText = snapshot
-            let sanitizedSnapshot = Self.sanitizeOuterMarkdownFence(in: snapshot)
-            if sanitizedSnapshot != lastYieldedText {
-              continuation.yield(sanitizedSnapshot)
-              lastYieldedText = sanitizedSnapshot
-            }
-          case let .failure(message):
-            throw TextFormattingClientError.serverError(statusCode: httpResponse.statusCode, message: message)
-          case .finished, .none:
-            break
-          }
+          try Self.dispatchAskStreamEvent(
+            eventName: &eventName,
+            dataLines: &dataLines,
+            accumulatedText: &accumulatedText,
+            lastYieldedText: &lastYieldedText,
+            diagnostics: &diagnostics,
+            statusCode: httpResponse.statusCode,
+            continuation: continuation,
+            isTrailingDispatch: true
+          )
 
           let finalAnswer = Self.sanitizeOuterMarkdownFence(in: accumulatedText).trimmed
           guard !finalAnswer.isEmpty else {
-            throw TextFormattingClientError.emptyResponse
+            throw TextFormattingClientError.emptyResponse(debugContext: diagnostics.render())
           }
 
           if finalAnswer != lastYieldedText {
@@ -280,11 +322,18 @@ actor TextFormattingClientLive {
           textFormattingLogger.debug("Ask stream response length=\(finalAnswer.count)")
           continuation.finish()
         } catch let error as TextFormattingClientError {
-          continuation.finish(throwing: error)
+          let enrichedError = error.attachingDebugContextIfNeeded(diagnostics.render())
+          Self.logAskStreamFailure(enrichedError)
+          continuation.finish(throwing: enrichedError)
         } catch is CancellationError {
           continuation.finish()
         } catch {
-          continuation.finish(throwing: TextFormattingClientError.transportFailure(error.localizedDescription))
+          let transportError = TextFormattingClientError.transportFailure(
+            error.localizedDescription,
+            debugContext: diagnostics.render()
+          )
+          Self.logAskStreamFailure(transportError)
+          continuation.finish(throwing: transportError)
         }
       }
 
@@ -339,12 +388,12 @@ actor TextFormattingClientLive {
     }
 
     guard let parsed = Self.parseFormattedText(from: responseObject) else {
-      throw TextFormattingClientError.emptyResponse
+      throw TextFormattingClientError.emptyResponse()
     }
 
     let formatted = Self.sanitizeOuterMarkdownFence(in: parsed)
     guard !formatted.isEmpty else {
-      throw TextFormattingClientError.emptyResponse
+      throw TextFormattingClientError.emptyResponse()
     }
 
     textFormattingLogger.debug("Formatting response length=\(formatted.count)")
@@ -518,6 +567,27 @@ actor TextFormattingClientLive {
   }
 
   private static func parseFormattedText(from response: [String: Any]) -> String? {
+    if let text = response["text"] as? String, !text.trimmed.isEmpty {
+      return text.trimmed
+    }
+
+    if let part = response["part"] as? [String: Any],
+       let partText = parseOutputTextPart(from: part)
+    {
+      return partText
+    }
+
+    if let item = response["item"] as? [String: Any] {
+      let text = extractContentFragments(from: item["content"]).joined(separator: "\n").trimmed
+      if !text.isEmpty { return text }
+    }
+
+    if let nestedResponse = response["response"] as? [String: Any],
+       let nestedText = parseFormattedText(from: nestedResponse)
+    {
+      return nestedText
+    }
+
     if let outputText = response["output_text"] as? String, !outputText.trimmed.isEmpty {
       return outputText.trimmed
     }
@@ -536,15 +606,7 @@ actor TextFormattingClientLive {
     }
 
     if let choices = response["choices"] as? [[String: Any]] {
-      let fragments = choices.flatMap { choice -> [String] in
-        guard let message = choice["message"] as? [String: Any] else { return [] }
-
-        if let contentString = message["content"] as? String {
-          return [contentString]
-        }
-
-        return extractContentFragments(from: message["content"])
-      }
+      let fragments = choices.flatMap(parseChoiceText(from:))
 
       let text = fragments.joined(separator: "\n").trimmed
       if !text.isEmpty { return text }
@@ -602,10 +664,201 @@ actor TextFormattingClientLive {
     return fragments
   }
 
+  private static func parseOutputTextPart(from part: [String: Any]) -> String? {
+    guard (part["type"] as? String) == "output_text" else { return nil }
+
+    if let text = part["text"] as? String, !text.trimmed.isEmpty {
+      return text.trimmed
+    }
+
+    if let textObject = part["text"] as? [String: Any],
+       let value = textObject["value"] as? String,
+       !value.trimmed.isEmpty
+    {
+      return value.trimmed
+    }
+
+    return nil
+  }
+
+  private static func parseChoiceText(from choice: [String: Any]) -> [String] {
+    if let delta = choice["delta"] as? [String: Any] {
+      if let contentString = delta["content"] as? String {
+        return [contentString]
+      }
+
+      let fragments = extractContentFragments(from: delta["content"])
+      if !fragments.isEmpty {
+        return fragments
+      }
+    }
+
+    guard let message = choice["message"] as? [String: Any] else { return [] }
+
+    if let contentString = message["content"] as? String {
+      return [contentString]
+    }
+
+    return extractContentFragments(from: message["content"])
+  }
+
   enum AskStreamEventUpdate: Equatable {
     case snapshot(String)
     case finished
     case failure(String?)
+  }
+
+  private struct AskStreamDiagnostics {
+    private static let maxEvents = 24
+    private static let maxPayloadLength = 800
+    private static let maxBodyLength = 1200
+
+    let provider: String
+    let model: String
+    let endpoint: String
+    var httpStatusCode: Int?
+    private var recentEvents: [String] = []
+
+    init(provider: String, model: String, endpoint: String) {
+      self.provider = provider
+      self.model = model
+      self.endpoint = endpoint
+    }
+
+    mutating func recordHTTPFailure(body: String?) {
+      guard let body, !body.isEmpty else { return }
+      appendEvent("http-body=\(Self.truncated(body, limit: Self.maxBodyLength))")
+    }
+
+    mutating func recordEvent(
+      eventName: String?,
+      payload: String,
+      update: AskStreamEventUpdate?,
+      accumulatedTextLength: Int
+    ) {
+      let rawEventName = eventName.flatMap { $0.isEmpty ? nil : $0 } ?? "<none>"
+      let outcome: String
+      switch update {
+      case let .snapshot(snapshot):
+        outcome = "snapshot(len=\(snapshot.count))"
+      case .finished:
+        outcome = "finished"
+      case let .failure(message):
+        if let message, !message.isEmpty {
+          outcome = "failure(\(message))"
+        } else {
+          outcome = "failure"
+        }
+      case nil:
+        outcome = "ignored"
+      }
+
+      appendEvent(
+        "event=\(rawEventName) outcome=\(outcome) accumulatedLen=\(accumulatedTextLength) data=\(Self.truncated(payload, limit: Self.maxPayloadLength))"
+      )
+    }
+
+    func render() -> String {
+      var lines = [
+        "provider=\(provider)",
+        "model=\(model)",
+        "endpoint=\(endpoint)",
+      ]
+
+      if let httpStatusCode {
+        lines.append("httpStatus=\(httpStatusCode)")
+      }
+
+      if recentEvents.isEmpty {
+        lines.append("recentEvents=<none>")
+      } else {
+        lines.append("recentEvents:")
+        lines.append(contentsOf: recentEvents.map { "- \($0)" })
+      }
+
+      return lines.joined(separator: "\n")
+    }
+
+    private mutating func appendEvent(_ event: String) {
+      recentEvents.append(event)
+      if recentEvents.count > Self.maxEvents {
+        recentEvents.removeFirst(recentEvents.count - Self.maxEvents)
+      }
+    }
+
+    private static func truncated(_ value: String, limit: Int) -> String {
+      let trimmedValue = value.trimmed
+      guard trimmedValue.count > limit else { return trimmedValue }
+      let endIndex = trimmedValue.index(trimmedValue.startIndex, offsetBy: limit)
+      return String(trimmedValue[..<endIndex]) + "…"
+    }
+  }
+
+  private nonisolated static func logAskStreamFailure(_ error: TextFormattingClientError) {
+    guard let description = error.errorDescription else { return }
+    textFormattingLogger.error("Ask stream failed: \(description, privacy: .public)")
+  }
+
+  private nonisolated static func dispatchAskStreamEvent(
+    eventName: inout String?,
+    dataLines: inout [String],
+    accumulatedText: inout String,
+    lastYieldedText: inout String,
+    diagnostics: inout AskStreamDiagnostics,
+    statusCode: Int,
+    continuation: AsyncThrowingStream<String, Error>.Continuation,
+    isTrailingDispatch: Bool = false
+  ) throws {
+    let dispatchedEventName = eventName
+    let eventPayload = dataLines.joined(separator: "\n")
+    let dispatchLabel = isTrailingDispatch ? "Trailing" : "Parsed"
+    textFormattingLogger.debug("\(dispatchLabel) event name: \(dispatchedEventName ?? "none"), data payload length: \(eventPayload.count)")
+
+    let update = parseAskStreamEvent(
+      eventName: dispatchedEventName,
+      data: eventPayload,
+      currentText: accumulatedText
+    )
+
+    switch update {
+    case let .snapshot(snapshot):
+      accumulatedText = snapshot
+      let sanitizedSnapshot = sanitizeOuterMarkdownFence(in: snapshot)
+      diagnostics.recordEvent(
+        eventName: dispatchedEventName,
+        payload: eventPayload,
+        update: update,
+        accumulatedTextLength: sanitizedSnapshot.count
+      )
+      if sanitizedSnapshot != lastYieldedText {
+        let logPrefix = isTrailingDispatch ? "Dispatching trailing snapshot" : "Dispatching snapshot"
+        textFormattingLogger.debug("\(logPrefix): length \(sanitizedSnapshot.count)")
+        continuation.yield(sanitizedSnapshot)
+        lastYieldedText = sanitizedSnapshot
+      }
+    case let .failure(message):
+      diagnostics.recordEvent(
+        eventName: dispatchedEventName,
+        payload: eventPayload,
+        update: update,
+        accumulatedTextLength: accumulatedText.count
+      )
+      throw TextFormattingClientError.serverError(
+        statusCode: statusCode,
+        message: message,
+        debugContext: diagnostics.render()
+      )
+    case .finished, .none:
+      diagnostics.recordEvent(
+        eventName: dispatchedEventName,
+        payload: eventPayload,
+        update: update,
+        accumulatedTextLength: accumulatedText.count
+      )
+    }
+
+    eventName = nil
+    dataLines.removeAll(keepingCapacity: true)
   }
 
   nonisolated static func parseAskStreamEvent(
@@ -637,6 +890,9 @@ actor TextFormattingClientLive {
     case "error":
       return .failure(responseObject["message"] as? String)
 
+    case "response.created", "response.in_progress", "response.output_item.added", "response.content_part.added":
+      return nil
+
     case "response.output_text.delta":
       guard let delta = responseObject["delta"] as? String, !delta.isEmpty else {
         return nil
@@ -646,6 +902,12 @@ actor TextFormattingClientLive {
     case "response.output_text.done":
       if let text = responseObject["text"] as? String, !text.isEmpty {
         return .snapshot(mergedStreamText(currentText: currentText, incomingText: text))
+      }
+      return nil
+
+    case "response.content_part.done", "response.output_item.done":
+      if let outputText = parseFormattedText(from: responseObject), !outputText.isEmpty {
+        return .snapshot(mergedStreamText(currentText: currentText, incomingText: outputText))
       }
       return nil
 
@@ -673,10 +935,15 @@ actor TextFormattingClientLive {
     return currentText + incomingText
   }
 
-  private nonisolated static func sseFieldValue(in line: String, prefix: String) -> String {
+  nonisolated static func normalizedSSELine(_ line: String) -> String {
+    line.trimmingCharacters(in: .newlines)
+  }
+
+  nonisolated static func sseFieldValue(in line: String, prefix: String) -> String {
     let startIndex = line.index(line.startIndex, offsetBy: prefix.count)
     let value = line[startIndex...]
-    return value.first == " " ? String(value.dropFirst()) : String(value)
+    let trimmedValue = value.first == " " ? value.dropFirst() : value[...]
+    return String(trimmedValue).trimmed
   }
 
   private func loadAPIKeyFromZshrc() throws -> String? {

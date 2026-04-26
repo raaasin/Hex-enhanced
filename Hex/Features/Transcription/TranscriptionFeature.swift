@@ -588,7 +588,7 @@ private extension TranscriptionFeature {
 
           let answer = finalAnswer.trimmingCharacters(in: .whitespacesAndNewlines)
           guard !answer.isEmpty else {
-            throw TextFormattingClientError.emptyResponse
+            throw TextFormattingClientError.emptyResponse()
           }
 
           await send(.askResponseReceived(answer, audioURL))
@@ -1028,12 +1028,12 @@ struct TranscriptionView: View {
   var status: TranscriptionIndicatorView.Status {
     if store.recordingMode == .ask && store.isRecording {
       return .askRecording
-    } else if store.recordingMode == .ask && store.isTranscribing {
-      return .askThinking
     } else if store.askErrorText != nil {
       return .askError
     } else if store.askAnswerText != nil {
       return .askAnswer
+    } else if store.recordingMode == .ask && store.isTranscribing {
+      return .askThinking
     } else if store.isTranscribing {
       if store.formatterSession != nil {
         return .formatting
@@ -1057,7 +1057,7 @@ struct TranscriptionView: View {
       status: status,
       meter: store.meter,
       errorText: store.formatterErrorText,
-      askText: store.askErrorText ?? store.askAnswerText ?? (status == .askThinking ? "Thinking..." : nil)
+      askText: store.askErrorText ?? store.askAnswerText
     )
     .task {
       await store.send(.task).finish()

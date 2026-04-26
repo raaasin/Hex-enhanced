@@ -78,12 +78,12 @@ struct TranscriptionIndicatorView: View {
   private let cornerRadius: CGFloat = 8
   private let baseWidth: CGFloat = 16
   private let expandedWidth: CGFloat = 56
-  private let askBubbleMinWidth: CGFloat = 260
-  private let askBubbleMaxWidth: CGFloat = 520
-  private let askBubbleExpandedMaxHeight: CGFloat = 300
+  private let askCardMinWidth: CGFloat = 300
+  private let askCardMaxWidth: CGFloat = 420
+  private let askCardHeight: CGFloat = 180
 
   private var bubbleText: String? {
-    if let askText, isAskStatus {
+    if let askText, isAskStatus, hasVisibleAskText {
       return askText
     }
     if let errorText {
@@ -137,17 +137,17 @@ struct TranscriptionIndicatorView: View {
       ?? CGRect(x: 0, y: 0, width: 1440, height: 900)
   }
 
-  private var askBubbleWidthLimit: CGFloat {
-    min(askBubbleMaxWidth, max(askBubbleMinWidth, currentVisibleFrame.width - 80))
+  private var askCardWidth: CGFloat {
+    min(askCardMaxWidth, max(askCardMinWidth, currentVisibleFrame.width - 80))
   }
 
-  private var askBubbleHeightLimit: CGFloat {
-    min(askBubbleExpandedMaxHeight, max(220, currentVisibleFrame.height * 0.35))
+  private var hasVisibleAskText: Bool {
+    guard let askText else { return false }
+    return !askText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
   }
 
-  private var shouldShowAskExpansionToggle: Bool {
-    guard let bubbleText else { return false }
-    return status != .askError && bubbleText.count > 220
+  private var showsAskCardOnly: Bool {
+    isAskStatus && (status == .askError || hasVisibleAskText)
   }
 
   var isHidden: Bool {
@@ -155,73 +155,74 @@ struct TranscriptionIndicatorView: View {
   }
 
   @State var transcribeEffect = 0
-  @State private var isAskExpanded = false
 
   var body: some View {
     let averagePower = min(1, meter.averagePower * 3)
     let peakPower = min(1, meter.peakPower * 3)
     ZStack {
-      Capsule()
-        .fill(backgroundColor.shadow(.inner(color: innerShadowColor, radius: 4)))
-        .overlay {
-          Capsule()
-            .stroke(strokeColor, lineWidth: 1)
-            .blendMode(.screen)
-        }
-        .overlay(alignment: .center) {
-            RoundedRectangle(cornerRadius: cornerRadius)
-              .fill((isAskStatus ? askBaseColor : .red).opacity(status == .recording || status == .askRecording ? (averagePower < 0.1 ? averagePower / 0.1 : 1) : 0))
-              .blur(radius: 2)
+      if !showsAskCardOnly {
+        Capsule()
+          .fill(backgroundColor.shadow(.inner(color: innerShadowColor, radius: 4)))
+          .overlay {
+            Capsule()
+              .stroke(strokeColor, lineWidth: 1)
               .blendMode(.screen)
-              .padding(6)
-        }
-        .overlay(alignment: .center) {
-            RoundedRectangle(cornerRadius: cornerRadius)
-              .fill(Color.white.opacity(status == .recording || status == .askRecording ? (averagePower < 0.1 ? averagePower / 0.1 : 0.5) : 0))
-              .blur(radius: 1)
-            .blendMode(.screen)
-            .frame(maxWidth: .infinity, alignment: .center)
-            .padding(7)
-        }
-        .overlay(alignment: .center) {
-          GeometryReader { proxy in
-            RoundedRectangle(cornerRadius: cornerRadius)
-              .fill((isAskStatus ? askBaseColor : .red).opacity(status == .recording || status == .askRecording ? (peakPower < 0.1 ? (peakPower / 0.1) * 0.5 : 0.5) : 0))
-              .frame(width: max(proxy.size.width * (peakPower + 0.6), 0), height: proxy.size.height, alignment: .center)
-              .frame(maxWidth: .infinity, alignment: .center)
-              .blur(radius: 4)
-              .blendMode(.screen)
-          }.padding(6)
-        }
-        .cornerRadius(cornerRadius)
-        .shadow(
-          color: (status == .recording || status == .askRecording) ? (isAskStatus ? askBaseColor : .red).opacity(averagePower) : .red.opacity(0),
-          radius: 4
-        )
-        .shadow(
-          color: (status == .recording || status == .askRecording) ? (isAskStatus ? askBaseColor : .red).opacity(averagePower * 0.5) : .red.opacity(0),
-          radius: 8
-        )
-        .animation(.interactiveSpring(), value: meter)
-        .frame(
-          width: status == .recording || status == .askRecording ? expandedWidth : status == .formatting || status == .askThinking ? 24 : 16,
-          height: baseWidth
-        )
-        .opacity(status == .hidden ? 0 : 1)
-        .scaleEffect(status == .hidden ? 0.0 : 1)
-        .blur(radius: status == .hidden ? 4 : 0)
-        .animation(.bouncy(duration: 0.3), value: status)
-        .changeEffect(.glow(color: (isAskStatus ? askBaseColor : .red).opacity(0.5), radius: 8), value: status)
-        .changeEffect(.shine(angle: .degrees(0), duration: 0.6), value: transcribeEffect)
-        .compositingGroup()
-        .task(id: status == .transcribing || status == .formatting || status == .askThinking) {
-          while (status == .transcribing || status == .formatting || status == .askThinking), !Task.isCancelled {
-            transcribeEffect += 1
-            try? await Task.sleep(for: .seconds(0.25))
           }
-        }
+          .overlay(alignment: .center) {
+              RoundedRectangle(cornerRadius: cornerRadius)
+                .fill((isAskStatus ? askBaseColor : .red).opacity(status == .recording || status == .askRecording ? (averagePower < 0.1 ? averagePower / 0.1 : 1) : 0))
+                .blur(radius: 2)
+                .blendMode(.screen)
+                .padding(6)
+          }
+          .overlay(alignment: .center) {
+              RoundedRectangle(cornerRadius: cornerRadius)
+                .fill(Color.white.opacity(status == .recording || status == .askRecording ? (averagePower < 0.1 ? averagePower / 0.1 : 0.5) : 0))
+                .blur(radius: 1)
+              .blendMode(.screen)
+              .frame(maxWidth: .infinity, alignment: .center)
+              .padding(7)
+          }
+          .overlay(alignment: .center) {
+            GeometryReader { proxy in
+              RoundedRectangle(cornerRadius: cornerRadius)
+                .fill((isAskStatus ? askBaseColor : .red).opacity(status == .recording || status == .askRecording ? (peakPower < 0.1 ? (peakPower / 0.1) * 0.5 : 0.5) : 0))
+                .frame(width: max(proxy.size.width * (peakPower + 0.6), 0), height: proxy.size.height, alignment: .center)
+                .frame(maxWidth: .infinity, alignment: .center)
+                .blur(radius: 4)
+                .blendMode(.screen)
+            }.padding(6)
+          }
+          .cornerRadius(cornerRadius)
+          .shadow(
+            color: (status == .recording || status == .askRecording) ? (isAskStatus ? askBaseColor : .red).opacity(averagePower) : .red.opacity(0),
+            radius: 4
+          )
+          .shadow(
+            color: (status == .recording || status == .askRecording) ? (isAskStatus ? askBaseColor : .red).opacity(averagePower * 0.5) : .red.opacity(0),
+            radius: 8
+          )
+          .animation(.interactiveSpring(), value: meter)
+          .frame(
+            width: status == .recording || status == .askRecording ? expandedWidth : status == .formatting || status == .askThinking ? 24 : 16,
+            height: baseWidth
+          )
+          .opacity(status == .hidden ? 0 : 1)
+          .scaleEffect(status == .hidden ? 0.0 : 1)
+          .blur(radius: status == .hidden ? 4 : 0)
+          .animation(.bouncy(duration: 0.3), value: status)
+          .changeEffect(.glow(color: (isAskStatus ? askBaseColor : .red).opacity(0.5), radius: 8), value: status)
+          .changeEffect(.shine(angle: .degrees(0), duration: 0.6), value: transcribeEffect)
+          .compositingGroup()
+          .task(id: status == .transcribing || status == .formatting || status == .askThinking) {
+            while (status == .transcribing || status == .formatting || status == .askThinking), !Task.isCancelled {
+              transcribeEffect += 1
+              try? await Task.sleep(for: .seconds(0.25))
+            }
+          }
+      }
 
-      if let modeSymbolName {
+      if !showsAskCardOnly, let modeSymbolName {
         Image(systemName: modeSymbolName)
           .font(.system(size: 9, weight: .semibold))
           .foregroundStyle(modeSymbolColor)
@@ -233,47 +234,22 @@ struct TranscriptionIndicatorView: View {
       if status != .hidden, let bubbleText {
         Group {
           if isAskStatus {
-            VStack(alignment: .leading, spacing: 8) {
+            ScrollView(.vertical, showsIndicators: true) {
               if status == .askError {
-                Text("ASK ERROR")
-                  .font(.system(size: 11, weight: .bold))
-                  .foregroundStyle(Color.white.opacity(0.85))
-
                 Text(bubbleText)
-                  .font(.system(size: 13, weight: .medium))
+                  .font(.system(size: 12, weight: .medium, design: .monospaced))
                   .foregroundColor(.white)
+                  .frame(maxWidth: .infinity, alignment: .leading)
                   .multilineTextAlignment(.leading)
-                  .lineLimit(6)
+                  .textSelection(.enabled)
               } else {
-                Group {
-                  if isAskExpanded {
-                    ScrollView(.vertical, showsIndicators: true) {
-                      askMarkdownBody(bubbleText)
-                    }
-                    .frame(maxHeight: askBubbleHeightLimit)
-                  } else {
-                    askMarkdownBody(bubbleText)
-                      .frame(maxHeight: 126, alignment: .top)
-                      .clipped()
-                  }
-                }
-              }
-
-              if shouldShowAskExpansionToggle {
-                Text(isAskExpanded ? "Collapse" : "Expand")
-                  .font(.system(size: 11, weight: .semibold))
-                  .foregroundStyle(Color.white.opacity(0.85))
+                askMarkdownBody(bubbleText)
               }
             }
+            .frame(width: askCardWidth, height: askCardHeight, alignment: .top)
             .padding(.horizontal, 12)
             .padding(.vertical, 10)
             .background(RoundedRectangle(cornerRadius: 10).fill(bubbleBackground))
-            .frame(minWidth: askBubbleMinWidth, maxWidth: askBubbleWidthLimit)
-            .onTapGesture {
-              if shouldShowAskExpansionToggle {
-                isAskExpanded.toggle()
-              }
-            }
           } else {
             Text(bubbleText)
               .font(.system(size: 12, weight: .medium))
@@ -289,14 +265,9 @@ struct TranscriptionIndicatorView: View {
               .frame(maxWidth: 240, alignment: .leading)
           }
         }
-          .offset(x: isAskStatus ? 0 : 14, y: isAskStatus ? -92 : -26)
+          .offset(x: isAskStatus ? 0 : 14, y: isAskStatus ? -112 : -26)
           .transition(.opacity.combined(with: .scale(scale: 0.96, anchor: .topLeading)))
           .zIndex(2)
-      }
-    }
-    .onChange(of: status) {
-      if status != .askAnswer {
-        isAskExpanded = false
       }
     }
     .enableInjection()
@@ -361,7 +332,7 @@ private extension Theme {
     TranscriptionIndicatorView(status: .optionKeyPressed, meter: .init(averagePower: 0, peakPower: 0), errorText: nil, askText: nil)
     TranscriptionIndicatorView(status: .formatterArmed, meter: .init(averagePower: 0, peakPower: 0), errorText: nil, askText: nil)
     TranscriptionIndicatorView(status: .formatting, meter: .init(averagePower: 0, peakPower: 0), errorText: nil, askText: nil)
-    TranscriptionIndicatorView(status: .askAnswer, meter: .init(averagePower: 0, peakPower: 0), errorText: nil, askText: "A short Ask answer stays in the purple card and can be expanded if needed.")
+    TranscriptionIndicatorView(status: .askAnswer, meter: .init(averagePower: 0, peakPower: 0), errorText: nil, askText: "A short Ask answer stays in the purple card with markdown support.")
     TranscriptionIndicatorView(status: .prewarming, meter: .init(averagePower: 0, peakPower: 0), errorText: "Selected text is too long to format.\nSelect a shorter passage and try again.", askText: nil)
   }
   .padding(40)
